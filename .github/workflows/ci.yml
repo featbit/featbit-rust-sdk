@@ -1,0 +1,44 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: Format, lint, and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install current toolchain
+        run: rustup toolchain install 1.97.1 --profile minimal --component rustfmt --component clippy
+      - name: Check formatting
+        run: cargo +1.97.1 fmt --all -- --check
+      - name: Run Clippy
+        run: cargo +1.97.1 clippy --all-targets --all-features -- -D warnings
+      - name: Run tests
+        run: cargo +1.97.1 test --all-features
+      - name: Run documentation tests
+        run: cargo +1.97.1 test --doc
+      - name: Compile examples
+        run: cargo +1.97.1 check --examples --all-features
+
+  rust-compatibility:
+    name: Rust ${{ matrix.rust }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [1.95.0, 1.96.0, 1.97.1]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust ${{ matrix.rust }}
+        run: rustup toolchain install ${{ matrix.rust }} --profile minimal
+      - name: Test supported toolchain
+        run: cargo +${{ matrix.rust }} test --all-features
