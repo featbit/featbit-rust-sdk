@@ -347,18 +347,33 @@ mod tests {
             {"id":"bool-id","key":"bool","updatedAt":1,"variationType":"boolean",
              "variations":[{"id":"bool-value","value":"TRUE"}],"isEnabled":true,
              "fallthrough":{"variations":[{"id":"bool-value","rollout":[0,1]}]}},
+            {"id":"false-id","key":"false-bool","updatedAt":1,"variationType":"boolean",
+             "variations":[{"id":"false-value","value":"FALSE"}],"isEnabled":true,
+             "fallthrough":{"variations":[{"id":"false-value","rollout":[0,1]}]}},
             {"id":"int-id","key":"int","updatedAt":1,"variationType":"number",
              "variations":[{"id":"int-value","value":"123"}],"isEnabled":true,
              "fallthrough":{"variations":[{"id":"int-value","rollout":[0,1]}]}},
             {"id":"bad-int-id","key":"bad-int","updatedAt":1,"variationType":"number",
              "variations":[{"id":"bad-int-value","value":"123.4"}],"isEnabled":true,
              "fallthrough":{"variations":[{"id":"bad-int-value","rollout":[0,1]}]}},
+            {"id":"bad-int-text-id","key":"bad-int-text","updatedAt":1,"variationType":"number",
+             "variations":[{"id":"bad-int-text-value","value":"v123"}],"isEnabled":true,
+             "fallthrough":{"variations":[{"id":"bad-int-text-value","rollout":[0,1]}]}},
             {"id":"float-id","key":"float","updatedAt":1,"variationType":"number",
              "variations":[{"id":"float-value","value":"123.45"}],"isEnabled":true,
              "fallthrough":{"variations":[{"id":"float-value","rollout":[0,1]}]}},
+            {"id":"whole-float-id","key":"whole-float","updatedAt":1,"variationType":"number",
+             "variations":[{"id":"whole-float-value","value":"123"}],"isEnabled":true,
+             "fallthrough":{"variations":[{"id":"whole-float-value","rollout":[0,1]}]}},
+            {"id":"double-id","key":"double","updatedAt":1,"variationType":"number",
+             "variations":[{"id":"double-value","value":"123.456"}],"isEnabled":true,
+             "fallthrough":{"variations":[{"id":"double-value","rollout":[0,1]}]}},
             {"id":"bad-float-id","key":"bad-float","updatedAt":1,"variationType":"number",
              "variations":[{"id":"bad-float-value","value":"NaN"}],"isEnabled":true,
              "fallthrough":{"variations":[{"id":"bad-float-value","rollout":[0,1]}]}},
+            {"id":"bad-float-text-id","key":"bad-float-text","updatedAt":1,"variationType":"number",
+             "variations":[{"id":"bad-float-text-value","value":"v123.4"}],"isEnabled":true,
+             "fallthrough":{"variations":[{"id":"bad-float-text-value","rollout":[0,1]}]}},
             {"id":"json-id","key":"json","updatedAt":1,"variationType":"json",
              "variations":[{"id":"json-value","value":"{\"enabled\":true}"}],"isEnabled":true,
              "fallthrough":{"variations":[{"id":"json-value","rollout":[0,1]}]}}
@@ -380,14 +395,30 @@ mod tests {
         let user = FbUser::builder("u1").build();
 
         assert!(client.bool_variation("bool", &user, false));
+        assert!(!client.bool_variation("false-bool", &user, true));
         assert_eq!(client.int_variation("int", &user, 0), 123);
         assert_eq!(client.int_variation("bad-int", &user, 7), 7);
+        assert_eq!(client.int_variation("bad-int-text", &user, 7), 7);
         assert_eq!(
             client.float_variation("float", &user, 0.0).to_bits(),
             123.45_f64.to_bits()
         );
         assert_eq!(
+            client.float_variation("whole-float", &user, 0.0).to_bits(),
+            123.0_f64.to_bits()
+        );
+        assert_eq!(
+            client.float_variation("double", &user, 0.0).to_bits(),
+            123.456_f64.to_bits()
+        );
+        assert_eq!(
             client.float_variation("bad-float", &user, 7.5).to_bits(),
+            7.5_f64.to_bits()
+        );
+        assert_eq!(
+            client
+                .float_variation("bad-float-text", &user, 7.5)
+                .to_bits(),
             7.5_f64.to_bits()
         );
         assert_eq!(client.string_variation("int", &user, "fallback"), "123");

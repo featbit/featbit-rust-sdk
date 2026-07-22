@@ -1,17 +1,20 @@
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio::time;
-use tokio_tungstenite::accept_async;
+use tokio_tungstenite::tungstenite::handshake::server::{Request, Response};
 use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame, Message};
+use tokio_tungstenite::{accept_async, accept_hdr_async};
 
 use super::super::{StatusTracker, SyncStatus, WebSocketDataSynchronizer};
 use super::support::{accept_test_socket, next_test_text, serve_until_client_close};
 use crate::client::FbClient;
-use crate::model::FbUser;
+use crate::model::{DataSet, FbUser, FeatureFlag};
 use crate::options::FbOptionsBuilder;
 use crate::store::SnapshotStore;
 use crate::worker::WorkerWait;
@@ -98,6 +101,177 @@ async fn client_synchronizes_full_and_patch_over_websocket() {
     tokio::task::spawn_blocking(move || client.close())
         .await
         .expect("client close task should finish");
+    server.await.expect("test server should stop");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn online_client_with_active_workers_closes_idempotently_from_multiple_threads() {
+    const EMPTY_FULL: &str = r#"{"messageType":"data-sync","data":{"eventType":"full","featureFlags":[],"segments":[]}}"#;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should have an address");
+    let server = tokio::spawn(async move {
+        let mut socket = accept_test_socket(&listener).await;
+        assert!(next_test_text(&mut socket)
+            .await
+            .contains("\"timestamp\":0"));
+        socket
+            .send(Message::Text(EMPTY_FULL.into()))
+            .await
+            .expect("empty full data should send");
+        serve_until_client_close(&mut socket).await;
+    });
+
+    let options = FbOptionsBuilder::new("valid-environment-secret")
+        .streaming_url(format!("ws://{address}"))
+        .start_wait(Duration::from_secs(2))
+        .connect_timeout(Duration::from_secs(1))
+        .close_timeout(Duration::from_secs(1))
+        .auto_flush_interval(Duration::from_mins(1))
+        .keep_alive_interval(Duration::from_mins(1))
+        .build()
+        .expect("options should build");
+    let client = tokio::task::spawn_blocking(move || FbClient::with_options(options))
+        .await
+        .expect("client construction task should finish");
+    assert_eq!(client.status(), crate::ClientStatus::Ready);
+
+    let barrier = Arc::new(Barrier::new(5));
+    let closers = (0..4)
+        .map(|_| {
+            let client = client.clone();
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                barrier.wait();
+                client.close();
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    for closer in closers {
+        closer.join().expect("client closer should finish");
+    }
+
+    assert_eq!(client.status(), crate::ClientStatus::Closed);
+    assert!(!client.flush_and_wait(Duration::from_millis(10)));
+    server.await.expect("test server should stop");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_handshake_rejection_retries_and_recovers() {
+    const EMPTY_FULL: &str = r#"{"messageType":"data-sync","data":{"eventType":"full","featureFlags":[],"segments":[]}}"#;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should have an address");
+    let server = tokio::spawn(async move {
+        let (mut rejected, _peer) = listener
+            .accept()
+            .await
+            .expect("first handshake should connect");
+        let mut request = [0_u8; 2_048];
+        let read = rejected
+            .read(&mut request)
+            .await
+            .expect("handshake request should be readable");
+        assert!(request[..read].starts_with(b"GET "));
+        rejected
+            .write_all(
+                b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("rejection should write");
+        rejected.shutdown().await.expect("rejection should close");
+
+        let mut socket = accept_test_socket(&listener).await;
+        assert!(next_test_text(&mut socket)
+            .await
+            .contains("\"timestamp\":0"));
+        socket
+            .send(Message::Text(EMPTY_FULL.into()))
+            .await
+            .expect("recovery full data should send");
+        serve_until_client_close(&mut socket).await;
+    });
+
+    let options = FbOptionsBuilder::new("valid-environment-secret")
+        .streaming_url(format!("ws://{address}"))
+        .disable_events(true, false)
+        .start_wait(Duration::from_secs(2))
+        .connect_timeout(Duration::from_secs(1))
+        .close_timeout(Duration::from_secs(1))
+        .reconnect_delays([Duration::from_millis(1)])
+        .build()
+        .expect("options should build");
+    let client = tokio::task::spawn_blocking(move || FbClient::with_options(options))
+        .await
+        .expect("client construction task should finish");
+
+    assert!(client.initialized());
+    assert_eq!(client.status(), crate::ClientStatus::Ready);
+    client.close();
+    server.await.expect("test server should stop");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initial_sync_uses_the_version_of_a_prepopulated_store() {
+    const NEWER_FULL: &str = r#"{"messageType":"data-sync","data":{"eventType":"full","featureFlags":[{"key":"newer","updatedAt":38}],"segments":[]}}"#;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should have an address");
+    let server = tokio::spawn(async move {
+        let mut socket = accept_test_socket(&listener).await;
+        let request = next_test_text(&mut socket).await;
+        assert!(request.contains("\"timestamp\":37"), "request: {request}");
+        socket
+            .send(Message::Text(NEWER_FULL.into()))
+            .await
+            .expect("newer full data should send");
+        serve_until_client_close(&mut socket).await;
+    });
+
+    let store = Arc::new(SnapshotStore::new());
+    store.populate(&DataSet {
+        event_type: "full".to_owned(),
+        feature_flags: vec![FeatureFlag {
+            key: "cached".to_owned(),
+            updated_at: 37,
+            ..FeatureFlag::default()
+        }],
+        ..DataSet::default()
+    });
+    let status = Arc::new(StatusTracker::new(SyncStatus::Starting, true));
+    let options = FbOptionsBuilder::new("valid-environment-secret")
+        .streaming_url(format!("ws://{address}"))
+        .disable_events(true, false)
+        .start_wait(Duration::from_secs(2))
+        .connect_timeout(Duration::from_secs(1))
+        .close_timeout(Duration::from_secs(1))
+        .build()
+        .expect("options should build");
+    let synchronizer =
+        WebSocketDataSynchronizer::start(options, Arc::clone(&store), Arc::clone(&status))
+            .expect("synchronizer should start");
+
+    for _ in 0..100 {
+        if store.version() == 38 && status.status() == SyncStatus::Ready {
+            break;
+        }
+        time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(store.version(), 38);
+    assert_eq!(status.status(), SyncStatus::Ready);
+    tokio::task::spawn_blocking(move || synchronizer.close())
+        .await
+        .expect("synchronizer close task should finish");
     server.await.expect("test server should stop");
 }
 
@@ -308,5 +482,240 @@ async fn unrecoverable_close_is_terminal_and_disables_stale_evaluation() {
     tokio::task::spawn_blocking(move || client.close())
         .await
         .expect("client close task should finish");
+    server.await.expect("test server should stop");
+}
+
+// Tungstenite fixes the handshake callback's large error type; the test cannot narrow it.
+#[allow(clippy::result_large_err)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn websocket_handshake_contains_protocol_path_query_and_user_agent() {
+    const EMPTY_FULL: &str = r#"{"messageType":"data-sync","data":{"eventType":"full","featureFlags":[],"segments":[]}}"#;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should have an address");
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("client should connect");
+        let callback = |request: &Request, response: Response| {
+            assert_eq!(request.uri().path(), "/proxy/streaming");
+            let query = request.uri().query().expect("query should be present");
+            assert!(query.contains("type=server"));
+            assert!(query.contains("token="));
+            assert_eq!(
+                request
+                    .headers()
+                    .get("user-agent")
+                    .and_then(|value| value.to_str().ok()),
+                Some(crate::user_agent().as_str())
+            );
+            Ok(response)
+        };
+        let mut socket = accept_hdr_async(stream, callback)
+            .await
+            .expect("WebSocket handshake should succeed");
+        assert!(next_test_text(&mut socket)
+            .await
+            .contains("\"timestamp\":0"));
+        socket
+            .send(Message::Text(EMPTY_FULL.into()))
+            .await
+            .expect("empty full data should send");
+        serve_until_client_close(&mut socket).await;
+    });
+
+    let options = FbOptionsBuilder::new("valid-environment-secret")
+        .streaming_url(format!("ws://{address}/proxy/"))
+        .disable_events(true, false)
+        .start_wait(Duration::from_secs(1))
+        .connect_timeout(Duration::from_millis(200))
+        .close_timeout(Duration::from_secs(1))
+        .build()
+        .expect("options should build");
+    let client = tokio::task::spawn_blocking(move || FbClient::with_options(options))
+        .await
+        .expect("client construction should finish");
+    assert!(client.initialized());
+    client.close();
+    server.await.expect("test server should stop");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn configured_connect_timeout_retries_a_stalled_handshake() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should have an address");
+    let (retried_sender, retried_receiver) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let (first, _) = listener
+            .accept()
+            .await
+            .expect("first connection should arrive");
+        let (second, _) = time::timeout(Duration::from_secs(1), listener.accept())
+            .await
+            .expect("connect timeout should trigger a retry")
+            .expect("second connection should arrive");
+        retried_sender
+            .send(())
+            .expect("retry observer should remain available");
+        time::sleep(Duration::from_millis(250)).await;
+        drop((first, second));
+    });
+
+    let options = FbOptionsBuilder::new("valid-environment-secret")
+        .streaming_url(format!("ws://{address}"))
+        .disable_events(true, false)
+        .start_wait(Duration::from_millis(200))
+        .connect_timeout(Duration::from_millis(50))
+        .close_timeout(Duration::from_millis(200))
+        .reconnect_delays([Duration::from_millis(1)])
+        .build()
+        .expect("options should build");
+    let client = tokio::task::spawn_blocking(move || FbClient::with_options(options))
+        .await
+        .expect("client construction should finish");
+    time::timeout(Duration::from_secs(1), retried_receiver)
+        .await
+        .expect("stalled handshake should time out and retry")
+        .expect("retry assertion should complete");
+    assert!(!client.initialized());
+    assert_eq!(client.status(), crate::ClientStatus::NotReady);
+
+    client.close();
+    server.await.expect("test server should stop");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unrecoverable_close_before_initialization_stops_without_becoming_ready() {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should have an address");
+    let server = tokio::spawn(async move {
+        let mut socket = accept_test_socket(&listener).await;
+        let _request = next_test_text(&mut socket).await;
+        socket
+            .send(Message::Close(Some(CloseFrame {
+                code: CloseCode::from(4003),
+                reason: "invalid environment".into(),
+            })))
+            .await
+            .expect("terminal close should send");
+        assert!(
+            time::timeout(Duration::from_millis(300), listener.accept())
+                .await
+                .is_err(),
+            "terminal close must not reconnect"
+        );
+    });
+
+    let options = FbOptionsBuilder::new("valid-environment-secret")
+        .streaming_url(format!("ws://{address}"))
+        .disable_events(true, false)
+        .start_wait(Duration::from_secs(1))
+        .connect_timeout(Duration::from_millis(200))
+        .close_timeout(Duration::from_secs(1))
+        .build()
+        .expect("options should build");
+    let client = tokio::task::spawn_blocking(move || FbClient::with_options(options))
+        .await
+        .expect("client construction should finish");
+    assert_eq!(client.status(), crate::ClientStatus::Closed);
+    assert!(!client.initialized());
+    let detail =
+        client.bool_variation_detail("never-loaded", &FbUser::builder("user-1").build(), false);
+    assert_eq!(detail.kind, crate::ReasonKind::ClientNotReady);
+
+    client.close();
+    server.await.expect("test server should stop");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disconnected_ready_client_becomes_stale_and_evaluates_cached_data() {
+    const FULL: &str = r#"{"messageType":"data-sync","data":{"eventType":"full","featureFlags":[{"id":"flag-id","key":"cached-flag","updatedAt":7,"variationType":"boolean","variations":[{"id":"value","value":"true"}],"isEnabled":true,"fallthrough":{"variations":[{"id":"value","rollout":[0,1]}]}}],"segments":[]}}"#;
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("test listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("listener should have an address");
+    let (disconnected_sender, disconnected_receiver) = oneshot::channel();
+    let (resume_sender, resume_receiver) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut first = accept_test_socket(&listener).await;
+        let _request = next_test_text(&mut first).await;
+        first
+            .send(Message::Text(FULL.into()))
+            .await
+            .expect("initial full data should send");
+        time::sleep(Duration::from_millis(20)).await;
+        first
+            .send(Message::Close(Some(CloseFrame {
+                code: CloseCode::from(1011),
+                reason: "temporary failure".into(),
+            })))
+            .await
+            .expect("recoverable close should send");
+        drop(first);
+        disconnected_sender
+            .send(())
+            .expect("disconnect observer should remain available");
+
+        resume_receiver
+            .await
+            .expect("test should allow reconnect handshake");
+        let mut second = accept_test_socket(&listener).await;
+        assert!(next_test_text(&mut second)
+            .await
+            .contains("\"timestamp\":7"));
+        second
+            .send(Message::Text(FULL.into()))
+            .await
+            .expect("resynchronized full data should send");
+        serve_until_client_close(&mut second).await;
+    });
+
+    let options = FbOptionsBuilder::new("valid-environment-secret")
+        .streaming_url(format!("ws://{address}"))
+        .disable_events(true, false)
+        .start_wait(Duration::from_secs(1))
+        .connect_timeout(Duration::from_millis(200))
+        .close_timeout(Duration::from_secs(1))
+        .reconnect_delays([Duration::from_millis(1)])
+        .build()
+        .expect("options should build");
+    let client = tokio::task::spawn_blocking(move || FbClient::with_options(options))
+        .await
+        .expect("client construction should finish");
+    disconnected_receiver
+        .await
+        .expect("server should close the stable connection");
+    for _ in 0..100 {
+        if client.status() == crate::ClientStatus::Stale {
+            break;
+        }
+        time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(client.status(), crate::ClientStatus::Stale);
+    assert!(client.bool_variation("cached-flag", &FbUser::builder("user-1").build(), false));
+
+    resume_sender
+        .send(())
+        .expect("reconnect server should remain available");
+    for _ in 0..100 {
+        if client.status() == crate::ClientStatus::Ready {
+            break;
+        }
+        time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(client.status(), crate::ClientStatus::Ready);
+
+    client.close();
     server.await.expect("test server should stop");
 }

@@ -138,12 +138,7 @@ impl FeatureProvider for FeatBitProvider {
     }
 
     fn status(&self) -> ProviderStatus {
-        match self.client.status() {
-            ClientStatus::NotReady => ProviderStatus::NotReady,
-            ClientStatus::Ready => ProviderStatus::Ready,
-            ClientStatus::Stale => ProviderStatus::STALE,
-            ClientStatus::Closed => ProviderStatus::Error,
-        }
+        provider_status(self.client.status())
     }
 
     async fn resolve_bool_value(
@@ -268,16 +263,7 @@ fn context_value_to_string(value: &EvaluationContextFieldValue) -> Option<String
 }
 
 fn resolution_details<T>(evaluated: EvalResult, value: T) -> ResolutionDetails<T> {
-    let reason = match &evaluated.reason {
-        EvalReason::Off => EvaluationReason::Disabled,
-        EvalReason::TargetMatch | EvalReason::RuleMatch { split: false, .. } => {
-            EvaluationReason::TargetingMatch
-        }
-        EvalReason::RuleMatch { split: true, .. } | EvalReason::Fallthrough { split: true } => {
-            EvaluationReason::Split
-        }
-        EvalReason::Fallthrough { split: false } => EvaluationReason::Default,
-    };
+    let reason = evaluation_reason(&evaluated.reason);
     let metadata = FlagMetadata::default()
         .with_value("flagId", evaluated.flag_id)
         .with_value("variationType", evaluated.flag_type);
@@ -286,6 +272,28 @@ fn resolution_details<T>(evaluated: EvalResult, value: T) -> ResolutionDetails<T
         variant: Some(evaluated.variation.id),
         reason: Some(reason),
         flag_metadata: Some(metadata),
+    }
+}
+
+fn provider_status(status: ClientStatus) -> ProviderStatus {
+    match status {
+        ClientStatus::NotReady => ProviderStatus::NotReady,
+        ClientStatus::Ready => ProviderStatus::Ready,
+        ClientStatus::Stale => ProviderStatus::STALE,
+        ClientStatus::Closed => ProviderStatus::Error,
+    }
+}
+
+fn evaluation_reason(reason: &EvalReason) -> EvaluationReason {
+    match reason {
+        EvalReason::Off => EvaluationReason::Disabled,
+        EvalReason::TargetMatch | EvalReason::RuleMatch { split: false, .. } => {
+            EvaluationReason::TargetingMatch
+        }
+        EvalReason::RuleMatch { split: true, .. } | EvalReason::Fallthrough { split: true } => {
+            EvaluationReason::Split
+        }
+        EvalReason::Fallthrough { split: false } => EvaluationReason::Default,
     }
 }
 

@@ -171,9 +171,12 @@ mod tests {
         ];
 
         for (user, operator, rule, expected) in fixtures {
+            let actual = operator_matches(user, operator, rule);
+            println!(
+                "condition user={user:?} operator={operator} rule={rule:?} expected={expected} actual={actual}"
+            );
             assert_eq!(
-                operator_matches(user, operator, rule),
-                expected,
+                actual, expected,
                 "unexpected result for {user:?} {operator} {rule:?}"
             );
         }

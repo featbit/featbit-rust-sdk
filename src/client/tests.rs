@@ -54,6 +54,28 @@ const UPDATED_BOOTSTRAP: &str = r#"{
         }],"segments":[]}
     }"#;
 
+const ALL_VARIATIONS_BOOTSTRAP: &str = r#"{
+    "messageType":"data-sync",
+    "data":{"eventType":"full","featureFlags":[{
+        "id":"b-id","key":"b-flag","updatedAt":1,"variationType":"string",
+        "variations":[{"id":"b-value","value":"bravo"}],
+        "isEnabled":true,"fallthrough":{"variations":[{"id":"b-value","rollout":[0,1]}]}
+    },{
+        "id":"a-id","key":"a-flag","updatedAt":1,"variationType":"string",
+        "variations":[{"id":"a-value","value":"alpha"}],
+        "isEnabled":true,"fallthrough":{"variations":[{"id":"a-value","rollout":[0,1]}]}
+    },{
+        "id":"archived-id","key":"archived","updatedAt":1,"variationType":"string",
+        "variations":[{"id":"archived-value","value":"hidden"}],
+        "isEnabled":true,"isArchived":true,
+        "fallthrough":{"variations":[{"id":"archived-value","rollout":[0,1]}]}
+    },{
+        "id":"malformed-id","key":"malformed","updatedAt":1,"variationType":"string",
+        "variations":[{"id":"value","value":"unused"}],
+        "isEnabled":false,"disabledVariationId":"missing"
+    }],"segments":[]}}
+"#;
+
 #[test]
 fn public_client_is_send_and_sync() {
     const fn assert_send_sync<T: Send + Sync>() {}
@@ -148,6 +170,95 @@ fn terminal_sync_status_never_evaluates_a_previously_ready_snapshot() {
     assert!(client.initialized(), "initialized records prior readiness");
     assert!(client.all_variations(&user).is_empty());
     client.close();
+}
+
+#[test]
+fn all_variations_returns_sorted_successes_without_recording_events() {
+    let mut server = mockito::Server::new();
+    let no_event_request = server
+        .mock("POST", "/api/public/insight/track")
+        .expect(0)
+        .create();
+    let options = FbOptionsBuilder::new("valid-secret")
+        .streaming_url("ws://127.0.0.1:9")
+        .event_url(server.url())
+        .start_wait(Duration::from_millis(2))
+        .connect_timeout(Duration::from_millis(1))
+        .auto_flush_interval(Duration::from_mins(1))
+        .build()
+        .expect("online options should build");
+    let client = FbClient::with_options(options);
+    let data = serde_json::from_str::<DataSyncEnvelope>(ALL_VARIATIONS_BOOTSTRAP)
+        .expect("all-variations bootstrap should parse")
+        .data;
+    client.inner.store.populate(&data);
+    client.inner.status.set(SyncStatus::Ready);
+
+    let results = client.all_variations(&FbUser::builder("user-1").build());
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].key, "a-flag");
+    assert_eq!(results[0].value, "alpha");
+    assert_eq!(results[0].variation_id, "a-value");
+    assert_eq!(results[0].kind, ReasonKind::Fallthrough);
+    assert_eq!(results[0].reason, "fall through targets and rules");
+    assert!(results[0].evaluation_event.is_none());
+    assert_eq!(results[1].key, "b-flag");
+    assert_eq!(results[1].value, "bravo");
+    assert_eq!(results[1].variation_id, "b-value");
+    assert!(results[1].evaluation_event.is_none());
+    assert!(results.iter().all(|result| result.key != "archived"));
+    assert!(results.iter().all(|result| result.key != "malformed"));
+
+    assert!(client.flush_and_wait(Duration::from_secs(1)));
+    client.close();
+    no_event_request.assert();
+}
+
+#[test]
+fn retained_evaluation_event_survives_a_newer_flag_snapshot() {
+    let (event_url, bodies, server) = scripted_http_server([202]);
+    let options = FbOptionsBuilder::new("valid-secret")
+        .streaming_url("ws://127.0.0.1:9")
+        .event_url(event_url)
+        .start_wait(Duration::from_millis(2))
+        .connect_timeout(Duration::from_millis(1))
+        .auto_flush_interval(Duration::from_mins(1))
+        .disable_events(true, true)
+        .build()
+        .expect("online options should build");
+    let client = FbClient::with_options(options);
+    let initial = serde_json::from_str::<DataSyncEnvelope>(READY_BOOTSTRAP)
+        .expect("initial data should parse")
+        .data;
+    client.inner.store.populate(&initial);
+    client.inner.status.set(SyncStatus::Ready);
+
+    let user = FbUser::builder("user-1").build();
+    let detail = client.bool_variation_detail("enabled", &user, false);
+    assert!(detail.value);
+    let retained = detail
+        .evaluation_event
+        .expect("successful detail should retain an event");
+
+    let updated = serde_json::from_str::<DataSyncEnvelope>(UPDATED_BOOTSTRAP)
+        .expect("updated data should parse")
+        .data;
+    client.inner.store.populate(&updated);
+    assert!(!client.bool_variation("enabled", &user, true));
+
+    assert!(client.track_eval_event(&user, &retained));
+    assert!(client.flush_and_wait(Duration::from_secs(2)));
+    client.close();
+    server.join().expect("event server should stop");
+
+    let body = bodies
+        .recv_timeout(Duration::from_secs(1))
+        .expect("retained event should be delivered");
+    let batch: serde_json::Value =
+        serde_json::from_slice(&body).expect("event batch should be JSON");
+    let variation = &batch[0]["variations"][0]["variation"];
+    assert_eq!(variation["id"], "value");
+    assert_eq!(variation["value"], "true");
 }
 
 #[test]

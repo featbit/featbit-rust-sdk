@@ -1,4 +1,4 @@
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read, Write};
 use std::net::TcpListener;
 use std::sync::Barrier;
 use std::thread;
@@ -8,13 +8,29 @@ use serde_json::Value;
 use url::Url;
 
 use super::*;
-use crate::test_support::scripted_http_server;
+use crate::test_support::{disconnect_then_http_server, scripted_http_server};
 
 fn test_user() -> FbUser {
     FbUser::builder("u1")
         .name("Ada")
         .custom("country", "cn")
         .build()
+}
+
+fn normalize_timestamps(value: &mut Value) {
+    match value {
+        Value::Array(values) => values.iter_mut().for_each(normalize_timestamps),
+        Value::Object(fields) => {
+            for (key, value) in fields {
+                if key == "timestamp" {
+                    *value = Value::from(0);
+                } else {
+                    normalize_timestamps(value);
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 #[test]
@@ -47,12 +63,113 @@ fn metric_wire_shape_identifies_rust_sdk() {
 }
 
 #[test]
-fn endpoint_preserves_base_path() {
-    let base = Url::parse("https://example.com/proxy/").expect("URL should parse");
-    assert_eq!(
-        event_endpoint(&base).as_str(),
-        "https://example.com/proxy/api/public/insight/track"
+fn single_multi_and_mixed_event_serialization_matches_featbit_wire_fixtures() {
+    let user_one = FbUser::builder("u1-Id")
+        .name("u1-name")
+        .custom("country", "us")
+        .custom("custom", "value")
+        .build();
+    let user_two = FbUser::builder("u2-Id")
+        .name("u2-name")
+        .custom("age", "10")
+        .build();
+    let eval_one = PayloadEvent::evaluation(
+        &user_one,
+        &FbEvaluationEvent::new("hello", "v1Id", "v1", true),
     );
+    let eval_two = PayloadEvent::evaluation(
+        &user_two,
+        &FbEvaluationEvent::new("hello", "v2Id", "v2", false),
+    );
+    let metric_one = PayloadEvent::metric(&user_one, "click-button", 1.5);
+    let metric_two = PayloadEvent::metric(&user_two, "click-button", 32.5);
+
+    let mut single_eval = serde_json::to_value(&eval_one).expect("evaluation should serialize");
+    normalize_timestamps(&mut single_eval);
+    assert_eq!(
+        single_eval,
+        serde_json::json!({
+            "user": {
+                "keyId": "u1-Id",
+                "name": "u1-name",
+                "customizedProperties": [
+                    {"name": "country", "value": "us"},
+                    {"name": "custom", "value": "value"}
+                ]
+            },
+            "variations": [{
+                "featureFlagKey": "hello",
+                "variation": {"id": "v1Id", "value": "v1"},
+                "timestamp": 0,
+                "sendToExperiment": true
+            }]
+        })
+    );
+
+    let mut evaluation_batch =
+        serde_json::to_value([eval_one.clone(), eval_two]).expect("batch should serialize");
+    normalize_timestamps(&mut evaluation_batch);
+    assert_eq!(evaluation_batch.as_array().map(Vec::len), Some(2));
+    assert_eq!(evaluation_batch[1]["user"]["keyId"], "u2-Id");
+    assert_eq!(
+        evaluation_batch[1]["variations"][0]["variation"]["value"],
+        "v2"
+    );
+    assert_eq!(
+        evaluation_batch[1]["variations"][0]["sendToExperiment"],
+        false
+    );
+
+    let mut metric_batch = serde_json::to_value([metric_one.clone(), metric_two])
+        .expect("metric batch should serialize");
+    normalize_timestamps(&mut metric_batch);
+    assert_eq!(metric_batch.as_array().map(Vec::len), Some(2));
+    assert_eq!(metric_batch[0]["metrics"][0]["appType"], "rust-server-side");
+    assert_eq!(metric_batch[0]["metrics"][0]["route"], "index/metric");
+    assert_eq!(metric_batch[0]["metrics"][0]["type"], "CustomEvent");
+    assert_eq!(metric_batch[1]["metrics"][0]["numericValue"], 32.5);
+
+    let mut mixed =
+        serde_json::to_value([eval_one, metric_one]).expect("mixed batch should serialize");
+    normalize_timestamps(&mut mixed);
+    assert_eq!(mixed.as_array().map(Vec::len), Some(2));
+    assert!(mixed[0].get("variations").is_some());
+    assert!(mixed[1].get("metrics").is_some());
+}
+
+#[test]
+fn endpoint_handles_root_nested_and_trailing_slash_base_urls() {
+    for (base, expected) in [
+        (
+            "https://example.com",
+            "https://example.com/api/public/insight/track",
+        ),
+        (
+            "https://example.com/",
+            "https://example.com/api/public/insight/track",
+        ),
+        (
+            "https://example.com/proxy",
+            "https://example.com/proxy/api/public/insight/track",
+        ),
+        (
+            "https://example.com/proxy/",
+            "https://example.com/proxy/api/public/insight/track",
+        ),
+    ] {
+        let base = Url::parse(base).expect("URL should parse");
+        assert_eq!(event_endpoint(&base).as_str(), expected);
+    }
+}
+
+#[test]
+fn queue_overflow_warning_state_is_suppressed_until_the_queue_recovers() {
+    let capacity_exceeded = AtomicBool::new(false);
+
+    assert!(should_log_event_queue_overflow(&capacity_exceeded));
+    assert!(!should_log_event_queue_overflow(&capacity_exceeded));
+    mark_event_queue_available(&capacity_exceeded);
+    assert!(should_log_event_queue_overflow(&capacity_exceeded));
 }
 
 #[test]
@@ -81,6 +198,165 @@ fn processor_posts_authorized_event_batch() {
     processor.close();
     assert!(!processor.flush_and_wait(Duration::from_secs(2)));
     request.assert();
+}
+
+#[test]
+fn active_processor_flushes_an_empty_buffer() {
+    let options = crate::options::FbOptionsBuilder::new("valid-secret")
+        .auto_flush_interval(Duration::from_mins(1))
+        .build()
+        .expect("options should build");
+    let processor = EventProcessor::new(&options);
+
+    assert!(processor.flush_and_wait(Duration::from_secs(1)));
+    processor.flush();
+    processor.close();
+}
+
+#[test]
+fn invalid_event_fields_are_rejected_before_enqueue() {
+    let options = crate::options::FbOptionsBuilder::new("valid-secret")
+        .auto_flush_interval(Duration::from_mins(1))
+        .build()
+        .expect("options should build");
+    let processor = EventProcessor::new(&options);
+    let valid_user = test_user();
+    let empty_user = FbUser::builder("").build();
+
+    assert!(!processor.record_evaluation(
+        &valid_user,
+        &FbEvaluationEvent::new("", "variation", "value", false)
+    ));
+    assert!(!processor.record_evaluation(
+        &valid_user,
+        &FbEvaluationEvent::new("flag", " ", "value", false)
+    ));
+    assert!(!processor.record_evaluation(
+        &empty_user,
+        &FbEvaluationEvent::new("flag", "variation", "value", false)
+    ));
+    assert!(!processor.record_metric(&valid_user, "", 1.0));
+    assert!(!processor.record_metric(&valid_user, "metric", f64::NAN));
+    assert!(!processor.record_metric(&valid_user, "metric", f64::INFINITY));
+    assert!(!processor.record_metric(&empty_user, "metric", 1.0));
+    assert!(processor.flush_and_wait(Duration::from_secs(1)));
+    processor.close();
+}
+
+#[test]
+fn auto_flush_interval_delivers_without_an_explicit_flush() {
+    let (event_url, bodies, server) = scripted_http_server([202]);
+    let options = crate::options::FbOptionsBuilder::new("valid-secret")
+        .event_url(event_url)
+        .auto_flush_interval(Duration::from_millis(20))
+        .build()
+        .expect("options should build");
+    let processor = EventProcessor::new(&options);
+
+    assert!(processor.record_metric(&test_user(), "interval", 1.0));
+    let body = bodies
+        .recv_timeout(Duration::from_secs(2))
+        .expect("automatic interval should flush the event");
+    let events: Value = serde_json::from_slice(&body).expect("batch should be JSON");
+    assert_eq!(events.as_array().map(Vec::len), Some(1));
+    assert_eq!(events[0]["metrics"][0]["eventName"], "interval");
+
+    processor.close();
+    server.join().expect("event server should stop");
+}
+
+#[test]
+fn batch_threshold_delivers_without_an_explicit_flush() {
+    let (event_url, bodies, server) = scripted_http_server([202]);
+    let options = crate::options::FbOptionsBuilder::new("valid-secret")
+        .event_url(event_url)
+        .auto_flush_interval(Duration::from_mins(1))
+        .max_events_per_request(2)
+        .build()
+        .expect("options should build");
+    let processor = EventProcessor::new(&options);
+
+    assert!(processor.record_metric(&test_user(), "threshold-1", 1.0));
+    assert!(processor.record_metric(&test_user(), "threshold-2", 2.0));
+    let body = bodies
+        .recv_timeout(Duration::from_secs(2))
+        .expect("batch threshold should flush both events");
+    let events: Value = serde_json::from_slice(&body).expect("batch should be JSON");
+    assert_eq!(events.as_array().map(Vec::len), Some(2));
+
+    processor.close();
+    server.join().expect("event server should stop");
+}
+
+#[test]
+fn event_request_timeout_is_bounded_and_reported_as_a_failed_flush() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("test listener should have an address");
+    let server = thread::spawn(move || {
+        let (mut stream, _peer) = listener.accept().expect("event request should connect");
+        let mut buffer = [0_u8; 2_048];
+        let _read = stream
+            .read(&mut buffer)
+            .expect("request should be readable");
+        thread::sleep(Duration::from_millis(250));
+    });
+    let options = crate::options::FbOptionsBuilder::new("valid-secret")
+        .event_url(format!("http://{address}"))
+        .auto_flush_interval(Duration::from_mins(1))
+        .event_request_timeout(Duration::from_millis(50))
+        .max_send_event_attempts(1)
+        .build()
+        .expect("options should build");
+    let processor = EventProcessor::new(&options);
+
+    assert!(processor.record_metric(&test_user(), "timeout", 1.0));
+    let started = Instant::now();
+    assert!(!processor.flush_and_wait(Duration::from_secs(1)));
+    assert!(started.elapsed() < Duration::from_millis(500));
+
+    processor.close();
+    server.join().expect("event server should stop");
+}
+
+#[test]
+fn caller_flush_timeout_returns_while_the_http_request_continues() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("test listener should have an address");
+    let server = thread::spawn(move || {
+        let (mut stream, _peer) = listener.accept().expect("event request should connect");
+        let mut buffer = [0_u8; 2_048];
+        let _read = stream
+            .read(&mut buffer)
+            .expect("request should be readable");
+        thread::sleep(Duration::from_millis(150));
+        write!(
+            stream,
+            "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .expect("response should write");
+        stream.flush().expect("response should flush");
+    });
+    let options = crate::options::FbOptionsBuilder::new("valid-secret")
+        .event_url(format!("http://{address}"))
+        .auto_flush_interval(Duration::from_mins(1))
+        .event_request_timeout(Duration::from_secs(1))
+        .flush_timeout(Duration::from_millis(500))
+        .max_send_event_attempts(1)
+        .build()
+        .expect("options should build");
+    let processor = EventProcessor::new(&options);
+
+    assert!(processor.record_metric(&test_user(), "slow-success", 1.0));
+    let started = Instant::now();
+    assert!(!processor.flush_and_wait(Duration::from_millis(20)));
+    assert!(started.elapsed() < Duration::from_millis(100));
+
+    server.join().expect("event server should stop");
+    processor.close();
 }
 
 #[test]
@@ -286,4 +562,30 @@ fn recoverable_failures_retry_and_unrecoverable_status_stops_delivery() {
     assert!(is_recoverable(StatusCode::INTERNAL_SERVER_ERROR));
     assert!(!is_recoverable(StatusCode::UNAUTHORIZED));
     assert!(!is_recoverable(StatusCode::NOT_FOUND));
+}
+
+#[test]
+fn connection_level_delivery_failure_retries_the_unchanged_batch() {
+    let (event_url, bodies, server) = disconnect_then_http_server(202);
+    let options = crate::options::FbOptionsBuilder::new("valid-secret")
+        .event_url(event_url)
+        .auto_flush_interval(Duration::from_mins(1))
+        .max_send_event_attempts(2)
+        .send_event_retry_interval(Duration::from_millis(1))
+        .build()
+        .expect("options should build");
+    let processor = EventProcessor::new(&options);
+
+    assert!(processor.record_metric(&test_user(), "transport-retry", 7.0));
+    assert!(processor.flush_and_wait(Duration::from_secs(2)));
+    processor.close();
+    server.join().expect("event server should stop");
+
+    let first = bodies
+        .recv_timeout(Duration::from_secs(1))
+        .expect("first request body should be captured");
+    let retry = bodies
+        .recv_timeout(Duration::from_secs(1))
+        .expect("retried request body should be captured");
+    assert_eq!(first, retry);
 }

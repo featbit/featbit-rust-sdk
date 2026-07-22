@@ -118,11 +118,11 @@ impl EventProcessor {
         };
         match sender.try_send(EventMessage::Payload(event)) {
             Ok(()) => {
-                inner.capacity_exceeded.store(false, Ordering::Release);
+                mark_event_queue_available(&inner.capacity_exceeded);
                 true
             }
             Err(TrySendError::Full(_)) => {
-                if !inner.capacity_exceeded.swap(true, Ordering::AcqRel) {
+                if should_log_event_queue_overflow(&inner.capacity_exceeded) {
                     log::warn!(
                         "FeatBit events are being produced faster than they can be processed; events will be dropped"
                     );
@@ -178,6 +178,14 @@ impl EventProcessor {
         };
         inner.close();
     }
+}
+
+fn mark_event_queue_available(capacity_exceeded: &AtomicBool) {
+    capacity_exceeded.store(false, Ordering::Release);
+}
+
+fn should_log_event_queue_overflow(capacity_exceeded: &AtomicBool) -> bool {
+    !capacity_exceeded.swap(true, Ordering::AcqRel)
 }
 
 #[derive(Debug)]

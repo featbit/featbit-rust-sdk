@@ -59,8 +59,14 @@ mod tests {
     #[test]
     fn rollout_of_key_matches_dotnet_dispatch_algorithm_vectors() {
         for (key, expected) in DOTNET_DISPATCH_FIXTURES {
+            let actual = rollout_of_key(key);
+            println!(
+                "dispatch key={key:?} expected={expected:.17} actual={actual:.17} expected_bits={:#018x} actual_bits={:#018x}",
+                expected.to_bits(),
+                actual.to_bits()
+            );
             assert_eq!(
-                rollout_of_key(key).to_bits(),
+                actual.to_bits(),
                 expected.to_bits(),
                 "dispatch result changed for {key}"
             );
@@ -79,5 +85,14 @@ mod tests {
         assert!(!is_in_rollout("key", &[0.8, 0.2]));
         assert!(!is_in_rollout("key", &[f64::NAN, 1.0]));
         assert!(!is_in_rollout("key", &[0.0, f64::INFINITY]));
+
+        let exact_boundary = rollout_of_key("test-value");
+        println!(
+            "inclusive rollout boundary key=\"test-value\" value={exact_boundary:.17} range=[{exact_boundary:.17}, {exact_boundary:.17}]"
+        );
+        assert!(is_in_rollout(
+            "test-value",
+            &[exact_boundary, exact_boundary]
+        ));
     }
 }

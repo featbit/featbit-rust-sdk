@@ -3,9 +3,12 @@ use std::sync::Arc;
 use std::thread;
 
 use super::Evaluator;
+use crate::evaluation::dispatch::rollout_of_key;
 use crate::evaluation::test_support::{basic_flag, rollout};
 use crate::evaluation::{EvalError, EvalReason};
-use crate::model::{Condition, DataSet, Fallthrough, FbUser, Segment, TargetRule, TargetUser};
+use crate::model::{
+    Condition, DataSet, Fallthrough, FbUser, RolloutVariation, Segment, TargetRule, TargetUser,
+};
 use crate::prepared::IS_IN_SEGMENT;
 use crate::store::{DataSnapshot, SnapshotStore};
 
@@ -214,6 +217,116 @@ fn experiment_delivery_matches_dotnet_target_rule_and_fallthrough_semantics() {
             .expect("fallthrough should resolve")
             .send_to_experiment
     );
+}
+
+#[test]
+fn rollout_selection_uses_dotnet_default_and_custom_dispatch_keys() {
+    let user = FbUser::builder("user-default")
+        .custom("bucket", "value")
+        .build();
+    let variations = vec![
+        RolloutVariation {
+            id: "true".to_owned(),
+            rollout: vec![0.0, 0.3],
+            expt_rollout: 0.0,
+        },
+        RolloutVariation {
+            id: "false".to_owned(),
+            rollout: vec![0.3, 1.0],
+            expt_rollout: 0.0,
+        },
+    ];
+
+    let mut default_key_flag = basic_flag("test-");
+    default_key_flag.fallthrough.variations = variations.clone();
+    let default_snapshot = DataSnapshot {
+        flags: [(default_key_flag.key.clone(), Arc::new(default_key_flag))].into(),
+        populated: true,
+        ..DataSnapshot::default()
+    };
+    let default_dispatch_key = "test-user-default";
+    let default_rollout = rollout_of_key(default_dispatch_key);
+    let default_result = Evaluator::evaluate(&default_snapshot, "test-", &user)
+        .expect("default dispatch key should select a rollout");
+    println!(
+        "evaluation flag=\"test-\" dispatch_source=default dispatch_key={default_dispatch_key:?} rollout={default_rollout:.17} variation={} reason={:?}",
+        default_result.variation.id, default_result.reason
+    );
+    assert_eq!(
+        default_rollout.to_bits(),
+        0.507_844_815_962_016_6_f64.to_bits()
+    );
+    assert_eq!(default_result.variation.id, "false");
+    assert_eq!(
+        default_result.reason,
+        EvalReason::Fallthrough { split: true }
+    );
+
+    let mut custom_key_flag = basic_flag("test-");
+    custom_key_flag.fallthrough.dispatch_key = Some("bucket".to_owned());
+    custom_key_flag.fallthrough.variations = variations;
+    let custom_snapshot = DataSnapshot {
+        flags: [(custom_key_flag.key.clone(), Arc::new(custom_key_flag))].into(),
+        populated: true,
+        ..DataSnapshot::default()
+    };
+    let custom_dispatch_key = "test-value";
+    let custom_rollout = rollout_of_key(custom_dispatch_key);
+    let custom_result = Evaluator::evaluate(&custom_snapshot, "test-", &user)
+        .expect("custom dispatch property should select a rollout");
+    println!(
+        "evaluation flag=\"test-\" dispatch_source=custom(bucket) dispatch_key={custom_dispatch_key:?} rollout={custom_rollout:.17} variation={} reason={:?}",
+        custom_result.variation.id, custom_result.reason
+    );
+    assert_eq!(
+        custom_rollout.to_bits(),
+        0.146_536_292_042_583_23_f64.to_bits()
+    );
+    assert_eq!(custom_result.variation.id, "true");
+    assert_eq!(
+        custom_result.reason,
+        EvalReason::Fallthrough { split: true }
+    );
+}
+
+#[test]
+fn experiment_sampling_uses_expt_prefixed_dispatch_key() {
+    let user = FbUser::builder("value").build();
+    let mut flag = basic_flag("test-");
+    flag.fallthrough.included_in_expt = true;
+    flag.fallthrough.variations = vec![RolloutVariation {
+        id: "true".to_owned(),
+        rollout: vec![0.0, 1.0],
+        expt_rollout: 0.5,
+    }];
+
+    let snapshot = |flag| DataSnapshot {
+        flags: [("test-".to_owned(), Arc::new(flag))].into(),
+        populated: true,
+        ..DataSnapshot::default()
+    };
+    let prefixed_rollout = rollout_of_key("expttest-value");
+    let excluded = Evaluator::evaluate(&snapshot(flag.clone()), "test-", &user)
+        .expect("fallthrough should resolve");
+    println!(
+        "evaluation experiment_dispatch_key=\"expttest-value\" rollout={prefixed_rollout:.17} experiment_upper=0.50000000000000000 send_to_experiment={}",
+        excluded.send_to_experiment
+    );
+    assert_eq!(
+        prefixed_rollout.to_bits(),
+        0.574_286_515_358_835_5_f64.to_bits()
+    );
+    assert!(!excluded.send_to_experiment);
+
+    let mut included_flag = flag;
+    included_flag.fallthrough.variations[0].expt_rollout = 0.6;
+    let included = Evaluator::evaluate(&snapshot(included_flag), "test-", &user)
+        .expect("fallthrough should resolve");
+    println!(
+        "evaluation experiment_dispatch_key=\"expttest-value\" rollout={prefixed_rollout:.17} experiment_upper=0.60000000000000000 send_to_experiment={}",
+        included.send_to_experiment
+    );
+    assert!(included.send_to_experiment);
 }
 
 #[test]

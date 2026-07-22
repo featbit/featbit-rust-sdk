@@ -28,6 +28,21 @@ fn defaults_match_the_featbit_server_contract() {
         Duration::from_millis(200)
     );
     assert_eq!(options.max_ws_message_size, 1024 * 1024);
+    assert_eq!(
+        options.reconnect_delays.as_ref(),
+        [
+            Duration::ZERO,
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            Duration::from_secs(3),
+            Duration::from_secs(5),
+            Duration::from_secs(8),
+            Duration::from_secs(13),
+            Duration::from_secs(21),
+            Duration::from_secs(34),
+            Duration::from_secs(55),
+        ]
+    );
     assert!(!options.offline);
     assert!(!options.disable_events);
     assert!(options.allow_track);
@@ -149,6 +164,130 @@ fn invalid_configuration_returns_typed_errors() {
             .build(),
         Err(ConfigError::InvalidDuration {
             field: "reconnect_delays",
+            ..
+        })
+    ));
+}
+
+#[test]
+fn validation_rejects_every_non_progressing_duration_and_capacity() {
+    type BuilderUpdate = fn(FbOptionsBuilder) -> FbOptionsBuilder;
+    let zero_durations: [(&str, BuilderUpdate); 7] = [
+        ("start_wait", |builder| builder.start_wait(Duration::ZERO)),
+        ("connect_timeout", |builder| {
+            builder.connect_timeout(Duration::ZERO)
+        }),
+        ("close_timeout", |builder| {
+            builder.close_timeout(Duration::ZERO)
+        }),
+        ("keep_alive_interval", |builder| {
+            builder.keep_alive_interval(Duration::ZERO)
+        }),
+        ("auto_flush_interval", |builder| {
+            builder.auto_flush_interval(Duration::ZERO)
+        }),
+        ("flush_timeout", |builder| {
+            builder.flush_timeout(Duration::ZERO)
+        }),
+        ("event_request_timeout", |builder| {
+            builder.event_request_timeout(Duration::ZERO)
+        }),
+    ];
+    for (expected_field, update) in zero_durations {
+        let error = update(FbOptionsBuilder::new("valid-secret"))
+            .build()
+            .expect_err("zero duration should be rejected");
+        assert!(matches!(
+            error,
+            ConfigError::InvalidDuration { field, .. } if field == expected_field
+        ));
+    }
+
+    let zero_capacities: [(&str, BuilderUpdate); 4] = [
+        ("max_events_in_queue", |builder| {
+            builder.max_events_in_queue(0)
+        }),
+        ("max_events_per_request", |builder| {
+            builder.max_events_per_request(0)
+        }),
+        ("max_send_event_attempts", |builder| {
+            builder.max_send_event_attempts(0)
+        }),
+        ("max_ws_message_size", |builder| {
+            builder.max_ws_message_size(0)
+        }),
+    ];
+    for (expected_field, update) in zero_capacities {
+        let error = update(FbOptionsBuilder::new("valid-secret"))
+            .build()
+            .expect_err("zero capacity should be rejected");
+        assert!(matches!(
+            error,
+            ConfigError::InvalidCapacity { field, .. } if field == expected_field
+        ));
+    }
+}
+
+#[test]
+fn validation_rejects_invalid_secret_url_and_limit_relationships() {
+    for secret in ["", "ab", "abc def", "密钥"] {
+        assert!(matches!(
+            FbOptionsBuilder::new(secret).build(),
+            Err(ConfigError::InvalidEnvironmentSecret)
+        ));
+    }
+
+    for builder in [
+        FbOptionsBuilder::new("valid-secret").event_url("ws://example.com"),
+        FbOptionsBuilder::new("valid-secret").streaming_url("wss://"),
+        FbOptionsBuilder::new("valid-secret").event_url("https://example.com/path#fragment"),
+    ] {
+        assert!(builder.build().is_err());
+    }
+
+    assert!(matches!(
+        FbOptionsBuilder::new("valid-secret")
+            .start_wait(Duration::from_secs(1))
+            .connect_timeout(Duration::from_secs(2))
+            .build(),
+        Err(ConfigError::InvalidDuration {
+            field: "start_wait",
+            ..
+        })
+    ));
+    assert!(matches!(
+        FbOptionsBuilder::new("valid-secret")
+            .reconnect_delays([])
+            .build(),
+        Err(ConfigError::EmptyReconnectDelays)
+    ));
+    assert!(matches!(
+        FbOptionsBuilder::new("valid-secret")
+            .reconnect_delays([Duration::ZERO, Duration::ZERO])
+            .build(),
+        Err(ConfigError::InvalidDuration {
+            field: "reconnect_delays",
+            ..
+        })
+    ));
+
+    let too_long = Duration::from_hours(8_784);
+    assert!(matches!(
+        FbOptionsBuilder::new("valid-secret")
+            .start_wait(too_long)
+            .connect_timeout(Duration::from_secs(1))
+            .build(),
+        Err(ConfigError::InvalidDuration {
+            field: "start_wait",
+            ..
+        })
+    ));
+    assert!(matches!(
+        FbOptionsBuilder::new("valid-secret")
+            .max_events_in_queue(1_000_001)
+            .build(),
+        Err(ConfigError::InvalidCapacity {
+            field: "max_events_in_queue",
             ..
         })
     ));
