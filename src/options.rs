@@ -94,8 +94,8 @@ impl fmt::Debug for FbOptions {
         formatter
             .debug_struct("FbOptions")
             .field("env_secret", &"[REDACTED]")
-            .field("streaming_url", &self.streaming_url)
-            .field("event_url", &self.event_url)
+            .field("streaming_url", &UrlSummary(&self.streaming_url))
+            .field("event_url", &UrlSummary(&self.event_url))
             .field("start_wait", &self.start_wait)
             .field("offline", &self.offline)
             .field("disable_events", &self.disable_events)
@@ -145,8 +145,8 @@ impl fmt::Debug for FbOptionsBuilder {
         formatter
             .debug_struct("FbOptionsBuilder")
             .field("env_secret", &"[REDACTED]")
-            .field("streaming_url", &self.streaming_url)
-            .field("event_url", &self.event_url)
+            .field("streaming_url", &UrlInputSummary(&self.streaming_url))
+            .field("event_url", &UrlInputSummary(&self.event_url))
             .field("start_wait", &self.start_wait)
             .field("offline", &self.offline)
             .field("disable_events", &self.disable_events)
@@ -195,6 +195,9 @@ impl FbOptionsBuilder {
     }
 
     /// Sets the WebSocket streaming base URL.
+    ///
+    /// A reverse-proxy base path is supported. Credentials, query parameters, and fragments are
+    /// rejected because the SDK constructs authentication and protocol query parameters itself.
     #[must_use]
     pub fn streaming_url(mut self, url: impl Into<String>) -> Self {
         self.streaming_url = url.into();
@@ -202,6 +205,9 @@ impl FbOptionsBuilder {
     }
 
     /// Sets the HTTP event service base URL.
+    ///
+    /// A reverse-proxy base path is supported. Credentials, query parameters, and fragments are
+    /// rejected; configure endpoint authentication outside the URL.
     #[must_use]
     pub fn event_url(mut self, url: impl Into<String>) -> Self {
         self.event_url = url.into();
@@ -410,6 +416,12 @@ impl FbOptionsBuilder {
         if self.reconnect_delays.is_empty() {
             return Err(ConfigError::EmptyReconnectDelays);
         }
+        if self.reconnect_delays.iter().all(Duration::is_zero) {
+            return Err(ConfigError::InvalidDuration {
+                field: "reconnect_delays",
+                message: "must contain at least one non-zero delay",
+            });
+        }
         if self
             .reconnect_delays
             .iter()
@@ -461,15 +473,57 @@ fn parse_url(field: &'static str, value: &str) -> Result<Url, ConfigError> {
             message: error.to_string(),
         })
         .and_then(|url| {
-            if url.host_str().is_some() {
-                Ok(url)
+            let validation_message = if url.host_str().is_none() {
+                Some("URL must contain a host")
+            } else if !url.username().is_empty() || url.password().is_some() {
+                Some("URL must not contain credentials")
+            } else if url.query().is_some() {
+                Some("URL must not contain a query")
+            } else if url.fragment().is_some() {
+                Some("URL must not contain a fragment")
             } else {
+                None
+            };
+            if let Some(message) = validation_message {
                 Err(ConfigError::InvalidUrl {
                     field,
-                    message: "URL must contain a host".to_owned(),
+                    message: message.to_owned(),
                 })
+            } else {
+                Ok(url)
             }
         })
+}
+
+struct UrlSummary<'a>(&'a Url);
+
+impl fmt::Debug for UrlSummary<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("Url")
+            .field("scheme", &self.0.scheme())
+            .field("host", &self.0.host_str())
+            .field("port", &self.0.port())
+            .field("has_base_path", &!matches!(self.0.path(), "" | "/"))
+            .field(
+                "has_credentials",
+                &(!self.0.username().is_empty() || self.0.password().is_some()),
+            )
+            .field("has_query", &self.0.query().is_some())
+            .field("has_fragment", &self.0.fragment().is_some())
+            .finish()
+    }
+}
+
+struct UrlInputSummary<'a>(&'a str);
+
+impl fmt::Debug for UrlInputSummary<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match Url::parse(self.0) {
+            Ok(url) => UrlSummary(&url).fmt(formatter),
+            Err(_) => formatter.write_str("[INVALID URL REDACTED]"),
+        }
+    }
 }
 
 fn validate_nonzero_duration(field: &'static str, duration: Duration) -> Result<(), ConfigError> {
@@ -548,19 +602,49 @@ mod tests {
     #[test]
     fn debug_output_redacts_credentials_and_bootstrap_data() {
         let builder = FbOptionsBuilder::new("do-not-log-this-secret")
+            .streaming_url(
+                "wss://url-user:url-password@example.com/private-stream-path?token=query-secret",
+            )
+            .event_url("https://example.com/private-event-path?api_key=event-secret")
             .offline(true)
             .bootstrap_json(EMPTY_BOOTSTRAP);
         let builder_debug = format!("{builder:?}");
         assert!(builder_debug.contains("[REDACTED]"));
         assert!(!builder_debug.contains("do-not-log-this-secret"));
         assert!(!builder_debug.contains("messageType"));
+        for secret in [
+            "url-user",
+            "url-password",
+            "private-stream-path",
+            "query-secret",
+            "private-event-path",
+            "event-secret",
+        ] {
+            assert!(!builder_debug.contains(secret));
+        }
 
-        let options = builder.build().expect("bootstrap options should build");
+        assert!(matches!(
+            builder.build(),
+            Err(ConfigError::InvalidUrl {
+                field: "streaming_url",
+                ..
+            })
+        ));
+
+        let options = FbOptionsBuilder::new("do-not-log-this-secret")
+            .streaming_url("wss://example.com/private-stream-path")
+            .event_url("https://example.com/private-event-path")
+            .offline(true)
+            .bootstrap_json(EMPTY_BOOTSTRAP)
+            .build()
+            .expect("bootstrap options should build");
         let options_debug = format!("{options:?}");
         assert!(options_debug.contains("[REDACTED]"));
         assert!(options_debug.contains("has_bootstrap: true"));
         assert!(!options_debug.contains("do-not-log-this-secret"));
         assert!(!options_debug.contains("messageType"));
+        assert!(!options_debug.contains("private-stream-path"));
+        assert!(!options_debug.contains("private-event-path"));
     }
 
     #[test]
@@ -590,6 +674,33 @@ mod tests {
                 .bootstrap_json("{}")
                 .build(),
             Err(ConfigError::InvalidBootstrap(_))
+        ));
+        assert!(matches!(
+            FbOptionsBuilder::new("valid-secret")
+                .event_url("https://user:password@example.com")
+                .build(),
+            Err(ConfigError::InvalidUrl {
+                field: "event_url",
+                ..
+            })
+        ));
+        assert!(matches!(
+            FbOptionsBuilder::new("valid-secret")
+                .streaming_url("wss://example.com?token=secret")
+                .build(),
+            Err(ConfigError::InvalidUrl {
+                field: "streaming_url",
+                ..
+            })
+        ));
+        assert!(matches!(
+            FbOptionsBuilder::new("valid-secret")
+                .reconnect_delays([Duration::ZERO])
+                .build(),
+            Err(ConfigError::InvalidDuration {
+                field: "reconnect_delays",
+                ..
+            })
         ));
     }
 }

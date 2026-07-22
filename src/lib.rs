@@ -14,7 +14,9 @@ mod events;
 mod model;
 mod open_feature;
 mod options;
+mod prepared;
 mod store;
+mod worker;
 
 pub use client::{ClientStatus, EvaluationDetail, FbClient, ReasonKind};
 pub use error::ConfigError;

@@ -148,7 +148,7 @@ Bootstrap JSON is deliberately restricted to offline mode so static data cannot 
 
 ## Configuration and lifecycle
 
-Defaults match the FeatBit .NET server SDK where practical: local endpoints, a 5-second initial wait, a 3-second connection timeout, 15-second keepalive, a 10,000-event queue, 50 events per request, and a 5-second auto-flush interval. Configure production deployments with `wss://` and `https://` endpoints.
+Defaults match the FeatBit .NET server SDK where practical: local endpoints, a 5-second initial wait, a 3-second connection timeout, 15-second keepalive, a 10,000-event queue, 50 events per request, and a 5-second auto-flush interval. Configure production deployments with `wss://` and `https://` endpoints. Endpoint base paths are supported, but credentials, query parameters, and fragments are rejected because the SDK supplies its own authentication and protocol query parameters.
 
 The OpenFeature provider reports `NotReady`, `Ready`, `Stale`, or `Error`; `provider.client().status()` exposes the more specific FeatBit lifecycle state when operational health checks need it. Evaluation remains local and lock-free on the read path. Network failures are logged and retried in background workers. Event queues are bounded, so analytics can be dropped under sustained overload rather than delaying application requests.
 

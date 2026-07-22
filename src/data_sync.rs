@@ -1,10 +1,8 @@
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant as StdInstant};
 
 use chrono::Utc;
-use crossbeam_channel::{bounded, Receiver};
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::{Condvar, Mutex};
 use rand::Rng;
@@ -21,6 +19,7 @@ use crate::model::DataSyncEnvelope;
 use crate::options::FbOptions;
 use crate::store::SnapshotStore;
 use crate::user_agent;
+use crate::worker::{WorkerThread, WorkerWait};
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
@@ -65,6 +64,7 @@ impl StatusTracker {
     }
 
     pub(crate) fn set(&self, status: SyncStatus) {
+        let _guard = self.wait_lock.lock();
         if status == SyncStatus::Ready {
             self.initialized.store(true, Ordering::Release);
         }
@@ -82,7 +82,7 @@ impl StatusTracker {
         let now = StdInstant::now();
         let deadline = now.checked_add(timeout).unwrap_or(now);
         let mut guard = self.wait_lock.lock();
-        while !self.initialized() {
+        while !self.initialized() && self.status() != SyncStatus::Closed {
             let Some(remaining) = deadline.checked_duration_since(StdInstant::now()) else {
                 break;
             };
@@ -102,8 +102,7 @@ impl StatusTracker {
 #[derive(Debug)]
 pub(crate) struct WebSocketDataSynchronizer {
     stop: watch::Sender<bool>,
-    completed: Receiver<()>,
-    worker: Mutex<Option<JoinHandle<()>>>,
+    worker: WorkerThread,
     status: Arc<StatusTracker>,
     close_timeout: Duration,
     closed: AtomicBool,
@@ -116,35 +115,30 @@ impl WebSocketDataSynchronizer {
         status: Arc<StatusTracker>,
     ) -> Option<Self> {
         let (stop, stop_receiver) = watch::channel(false);
-        let (completed_sender, completed) = bounded(1);
         let worker_status = Arc::clone(&status);
         let close_timeout = options.close_timeout;
-        let worker = thread::Builder::new()
-            .name("featbit-data-synchronizer".to_owned())
-            .spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build();
-                match runtime {
-                    Ok(runtime) => runtime.block_on(run_sync_loop(
-                        options,
-                        store,
-                        Arc::clone(&worker_status),
-                        stop_receiver,
-                    )),
-                    Err(error) => {
-                        log::error!("failed to create FeatBit WebSocket runtime: {error}");
-                        worker_status.set(SyncStatus::Closed);
-                    }
+        let worker = WorkerThread::spawn("data synchronizer", move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build();
+            match runtime {
+                Ok(runtime) => runtime.block_on(run_sync_loop(
+                    options,
+                    store,
+                    Arc::clone(&worker_status),
+                    stop_receiver,
+                )),
+                Err(error) => {
+                    log::error!("failed to create FeatBit WebSocket runtime: {error}");
+                    worker_status.set(SyncStatus::Closed);
                 }
-                let _ignored = completed_sender.send(());
-            });
+            }
+        });
 
         match worker {
             Ok(worker) => Some(Self {
                 stop,
-                completed,
-                worker: Mutex::new(Some(worker)),
+                worker,
                 status,
                 close_timeout,
                 closed: AtomicBool::new(false),
@@ -159,20 +153,18 @@ impl WebSocketDataSynchronizer {
 
     pub(crate) fn close(&self) {
         if self.closed.swap(true, Ordering::AcqRel) {
+            let _ignored = self.worker.wait(Duration::ZERO);
             return;
         }
         let _ignored = self.stop.send(true);
-        let completed = self.completed.recv_timeout(self.close_timeout).is_ok();
-        let worker = self.worker.lock().take();
-        if completed {
-            if let Some(worker) = worker {
-                if worker.join().is_err() {
-                    log::warn!("FeatBit WebSocket worker stopped after a panic");
-                }
+        match self.worker.wait(self.close_timeout) {
+            WorkerWait::Completed => {}
+            WorkerWait::Panicked => {
+                log::warn!("FeatBit WebSocket worker stopped after a panic");
             }
-        } else {
-            log::warn!("FeatBit WebSocket worker did not close within the configured timeout");
-            drop(worker);
+            WorkerWait::TimedOut => {
+                log::warn!("FeatBit WebSocket worker did not close within the configured timeout");
+            }
         }
         self.status.set(SyncStatus::Closed);
     }
@@ -201,23 +193,35 @@ async fn run_sync_loop(
             status.set(SyncStatus::Stale);
         }
 
-        match connect(&options).await {
+        let connection = tokio::select! {
+            biased;
+            () = wait_for_stop(&mut stop) => break,
+            connection = connect(&options) => connection,
+        };
+
+        match connection {
             Ok(mut socket) => {
                 retry_attempt = 0;
                 log::debug!("FeatBit WebSocket connected");
-                if send_data_sync(&mut socket, store.version()).await.is_err() {
-                    log::debug!("failed to send FeatBit data-sync request");
-                } else {
-                    match run_connection(&mut socket, &options, &store, &status, &mut stop).await {
-                        ConnectionEnd::Stopped => break,
-                        ConnectionEnd::Terminal(code) => {
-                            log::error!(
-                                "FeatBit WebSocket closed without reconnecting (code {code})"
-                            );
-                            status.set(SyncStatus::Closed);
-                            return;
+                match send_data_sync(&mut socket, store.version(), &options, &mut stop).await {
+                    SocketSend::Stopped => break,
+                    SocketSend::Failed(error) => {
+                        log::debug!("failed to send FeatBit data-sync request: {error}");
+                    }
+                    SocketSend::Sent => {
+                        match run_connection(&mut socket, &options, &store, &status, &mut stop)
+                            .await
+                        {
+                            ConnectionEnd::Stopped => break,
+                            ConnectionEnd::Terminal(code) => {
+                                log::error!(
+                                    "FeatBit WebSocket closed without reconnecting (code {code})"
+                                );
+                                status.set(SyncStatus::Closed);
+                                return;
+                            }
+                            ConnectionEnd::Reconnect => {}
                         }
-                        ConnectionEnd::Reconnect => {}
                     }
                 }
             }
@@ -233,12 +237,9 @@ async fn run_sync_loop(
         retry_attempt = retry_attempt.saturating_add(1);
         log::debug!("reconnecting FeatBit WebSocket after {delay:?}");
         tokio::select! {
+            biased;
+            () = wait_for_stop(&mut stop) => break,
             () = time::sleep(delay) => {}
-            changed = stop.changed() => {
-                if changed.is_err() || *stop.borrow() {
-                    break;
-                }
-            }
         }
     }
 
@@ -264,20 +265,28 @@ async fn connect(options: &FbOptions) -> Result<Socket, String> {
     let connection = tokio_tungstenite::connect_async_with_config(request, Some(config), false);
     match time::timeout(options.connect_timeout, connection).await {
         Ok(Ok((socket, _response))) => Ok(socket),
-        Ok(Err(error)) => Err(error.to_string()),
+        Ok(Err(_error)) => Err("connection failed".to_owned()),
         Err(_) => Err("connection timed out".to_owned()),
     }
 }
 
-async fn send_data_sync(socket: &mut Socket, version: i64) -> Result<(), String> {
+async fn send_data_sync(
+    socket: &mut Socket,
+    version: i64,
+    options: &FbOptions,
+    stop: &mut watch::Receiver<bool>,
+) -> SocketSend {
     let request = serde_json::json!({
         "messageType": "data-sync",
         "data": { "timestamp": version.max(0) }
     });
-    socket
-        .send(Message::Text(request.to_string().into()))
-        .await
-        .map_err(|error| error.to_string())
+    send_socket_message(
+        socket,
+        Message::Text(request.to_string().into()),
+        options.connect_timeout,
+        stop,
+    )
+    .await
 }
 
 async fn run_connection(
@@ -292,17 +301,28 @@ async fn run_connection(
 
     loop {
         tokio::select! {
-            changed = stop.changed() => {
-                if changed.is_err() || *stop.borrow() {
-                    let _ignored = time::timeout(options.close_timeout, socket.close(None)).await;
-                    return ConnectionEnd::Stopped;
-                }
+            () = wait_for_stop(stop) => {
+                let _ignored = time::timeout(
+                    graceful_work_budget(options.close_timeout),
+                    socket.close(None),
+                )
+                .await;
+                return ConnectionEnd::Stopped;
             }
             _ = ping.tick() => {
                 let message = Message::Text("{\"messageType\":\"ping\",\"data\":{}}".into());
-                if let Err(error) = socket.send(message).await {
-                    log::debug!("failed to send FeatBit WebSocket ping: {error}");
-                    return ConnectionEnd::Reconnect;
+                match send_socket_message(
+                    socket,
+                    message,
+                    options.connect_timeout,
+                    stop,
+                ).await {
+                    SocketSend::Sent => {}
+                    SocketSend::Stopped => return ConnectionEnd::Stopped,
+                    SocketSend::Failed(error) => {
+                        log::debug!("failed to send FeatBit WebSocket ping: {error}");
+                        return ConnectionEnd::Reconnect;
+                    }
                 }
             }
             incoming = socket.next() => {
@@ -322,8 +342,15 @@ async fn run_connection(
                         apply_message(store, status, &bytes);
                     }
                     Some(Ok(Message::Ping(payload))) => {
-                        if socket.send(Message::Pong(payload)).await.is_err() {
-                            return ConnectionEnd::Reconnect;
+                        match send_socket_message(
+                            socket,
+                            Message::Pong(payload),
+                            options.connect_timeout,
+                            stop,
+                        ).await {
+                            SocketSend::Sent => {}
+                            SocketSend::Stopped => return ConnectionEnd::Stopped,
+                            SocketSend::Failed(_) => return ConnectionEnd::Reconnect,
                         }
                     }
                     Some(Ok(Message::Pong(_) | Message::Frame(_))) => {}
@@ -374,6 +401,45 @@ fn apply_message(store: &SnapshotStore, status: &StatusTracker, payload: &[u8]) 
         store.version()
     );
     status.set(SyncStatus::Ready);
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum SocketSend {
+    Sent,
+    Stopped,
+    Failed(String),
+}
+
+async fn send_socket_message(
+    socket: &mut Socket,
+    message: Message,
+    timeout: Duration,
+    stop: &mut watch::Receiver<bool>,
+) -> SocketSend {
+    tokio::select! {
+        biased;
+        () = wait_for_stop(stop) => SocketSend::Stopped,
+        result = time::timeout(timeout, socket.send(message)) => match result {
+            Ok(Ok(())) => SocketSend::Sent,
+            Ok(Err(error)) => SocketSend::Failed(error.to_string()),
+            Err(_) => SocketSend::Failed("WebSocket write timed out".to_owned()),
+        },
+    }
+}
+
+async fn wait_for_stop(stop: &mut watch::Receiver<bool>) {
+    loop {
+        if *stop.borrow() {
+            return;
+        }
+        if stop.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+fn graceful_work_budget(timeout: Duration) -> Duration {
+    timeout.saturating_sub((timeout / 4).min(Duration::from_millis(100)))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -452,11 +518,13 @@ fn reconnect_delay(options: &FbOptions, attempt: usize) -> Duration {
 
 #[cfg(test)]
 mod tests {
+    use std::thread;
     use std::time::Duration;
 
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
     use tokio_tungstenite::accept_async;
+    use tokio_tungstenite::tungstenite::protocol::{frame::coding::CloseCode, CloseFrame};
 
     use super::*;
     use crate::client::FbClient;
@@ -511,6 +579,23 @@ mod tests {
         let stale = br#"{"messageType":"data-sync","data":{"eventType":"patch","featureFlags":[{"key":"flag","updatedAt":1,"isArchived":false}],"segments":[]}}"#;
         apply_message(&store, &status, stale);
         assert!(store.load().flags["flag"].is_archived);
+    }
+
+    #[test]
+    fn initialization_wait_handles_ready_and_terminal_notifications() {
+        for _ in 0..100 {
+            let status = Arc::new(StatusTracker::new(SyncStatus::Starting, false));
+            let setter_status = Arc::clone(&status);
+            let setter = thread::spawn(move || setter_status.set(SyncStatus::Ready));
+            assert!(status.wait_until_initialized(Duration::from_secs(1)));
+            setter.join().expect("status setter should finish");
+        }
+
+        let terminal = StatusTracker::new(SyncStatus::Starting, false);
+        terminal.set(SyncStatus::Closed);
+        let started = StdInstant::now();
+        assert!(!terminal.wait_until_initialized(Duration::from_secs(30)));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -591,6 +676,255 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(patched, "patch should become visible to evaluation");
+
+        tokio::task::spawn_blocking(move || client.close())
+            .await
+            .expect("client close task should finish");
+        server.await.expect("test server should stop");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn close_cancels_a_stalled_websocket_handshake() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should have an address");
+        let options = FbOptionsBuilder::new("valid-environment-secret")
+            .streaming_url(format!("ws://{address}"))
+            .disable_events(true)
+            .start_wait(Duration::from_secs(30))
+            .connect_timeout(Duration::from_secs(30))
+            .close_timeout(Duration::from_millis(400))
+            .build()
+            .expect("options should build");
+        let status = Arc::new(StatusTracker::new(SyncStatus::Starting, false));
+        let synchronizer = Arc::new(
+            WebSocketDataSynchronizer::start(
+                options,
+                Arc::new(SnapshotStore::new()),
+                Arc::clone(&status),
+            )
+            .expect("synchronizer should start"),
+        );
+
+        let (_stalled_stream, _peer) = time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("client should connect before the test timeout")
+            .expect("test listener should accept the client");
+        let started = StdInstant::now();
+        let closing = Arc::clone(&synchronizer);
+        tokio::task::spawn_blocking(move || closing.close())
+            .await
+            .expect("close task should finish");
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(status.status(), SyncStatus::Closed);
+        assert_eq!(
+            synchronizer.worker.wait(Duration::from_secs(1)),
+            WorkerWait::Completed
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unrecoverable_close_is_terminal_and_disables_stale_evaluation() {
+        const FULL: &str = r#"{"messageType":"data-sync","data":{"eventType":"full","featureFlags":[{"id":"flag-id","key":"terminal-flag","updatedAt":1,"variationType":"boolean","variations":[{"id":"value","value":"true"}],"targetUsers":[],"rules":[],"isEnabled":true,"fallthrough":{"variations":[{"id":"value","rollout":[0,1],"exptRollout":0}]}}],"segments":[]}}"#;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should have an address");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("client should connect");
+            let mut socket = accept_async(stream)
+                .await
+                .expect("WebSocket handshake should succeed");
+            let _request = socket
+                .next()
+                .await
+                .expect("client should request data")
+                .expect("data request should be valid");
+            socket
+                .send(Message::Text(FULL.into()))
+                .await
+                .expect("full data should send");
+            socket
+                .send(Message::Close(Some(CloseFrame {
+                    code: CloseCode::from(4003),
+                    reason: "terminal".into(),
+                })))
+                .await
+                .expect("terminal close should send");
+
+            assert!(
+                time::timeout(Duration::from_millis(300), listener.accept())
+                    .await
+                    .is_err(),
+                "terminal close must not reconnect"
+            );
+        });
+
+        let options = FbOptionsBuilder::new("valid-environment-secret")
+            .streaming_url(format!("ws://{address}"))
+            .disable_events(true)
+            .start_wait(Duration::from_secs(2))
+            .connect_timeout(Duration::from_secs(1))
+            .close_timeout(Duration::from_secs(1))
+            .keep_alive_interval(Duration::from_mins(1))
+            .build()
+            .expect("options should build");
+        let client = tokio::task::spawn_blocking(move || FbClient::with_options(options))
+            .await
+            .expect("client construction task should finish");
+        let user = FbUser::builder("user-1").build();
+
+        for _ in 0..100 {
+            if client.status() == crate::ClientStatus::Closed {
+                break;
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(client.status(), crate::ClientStatus::Closed);
+        assert!(client.initialized());
+        let detail = client.bool_variation_detail("terminal-flag", &user, false);
+        assert!(!detail.value);
+        assert_eq!(detail.kind, crate::ReasonKind::ClientNotReady);
+
+        tokio::task::spawn_blocking(move || client.close())
+            .await
+            .expect("client close task should finish");
+        server.await.expect("test server should stop");
+    }
+
+    const RECONNECT_FULL: &str = r#"{"messageType":"data-sync","data":{"eventType":"full","featureFlags":[{"id":"flag-id","key":"reconnected-flag","updatedAt":7,"variationType":"boolean","variations":[{"id":"value","value":"true"}],"targetUsers":[],"rules":[],"isEnabled":true,"fallthrough":{"variations":[{"id":"value","rollout":[0,1],"exptRollout":0}]}}],"segments":[]}}"#;
+
+    type TestSocket = WebSocketStream<TcpStream>;
+
+    async fn accept_test_socket(listener: &TcpListener) -> TestSocket {
+        let (stream, _) = time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("client should connect before the test timeout")
+            .expect("test listener should accept the client");
+        accept_async(stream)
+            .await
+            .expect("test WebSocket handshake should succeed")
+    }
+
+    async fn next_test_text(socket: &mut TestSocket) -> String {
+        socket
+            .next()
+            .await
+            .expect("client should send a message")
+            .expect("client message should be valid")
+            .into_text()
+            .expect("client message should be text")
+            .to_string()
+    }
+
+    async fn run_reconnect_protocol_server(
+        listener: TcpListener,
+        version_sender: oneshot::Sender<()>,
+    ) {
+        let mut first = accept_test_socket(&listener).await;
+        assert!(next_test_text(&mut first).await.contains("\"timestamp\":0"));
+        first
+            .send(Message::Text("not-json".into()))
+            .await
+            .expect("malformed test message should send");
+        let ping = time::timeout(Duration::from_secs(1), async {
+            loop {
+                let text = next_test_text(&mut first).await;
+                if text.contains("\"messageType\":\"ping\"") {
+                    break text;
+                }
+            }
+        })
+        .await
+        .expect("application ping should arrive");
+        assert_eq!(ping, "{\"messageType\":\"ping\",\"data\":{}}");
+        first
+            .send(Message::Text("x".repeat(2_048).into()))
+            .await
+            .expect("oversized message should reach the client");
+        drop(first);
+
+        let mut second = accept_test_socket(&listener).await;
+        assert!(next_test_text(&mut second)
+            .await
+            .contains("\"timestamp\":0"));
+        second
+            .send(Message::Text(RECONNECT_FULL.into()))
+            .await
+            .expect("full data should send after reconnect");
+        second
+            .send(Message::Close(Some(CloseFrame {
+                code: CloseCode::from(1011),
+                reason: "retry".into(),
+            })))
+            .await
+            .expect("recoverable close should send");
+        drop(second);
+
+        let mut third = accept_test_socket(&listener).await;
+        assert!(next_test_text(&mut third).await.contains("\"timestamp\":7"));
+        third
+            .send(Message::Text(RECONNECT_FULL.into()))
+            .await
+            .expect("full data should restore ready state");
+        version_sender
+            .send(())
+            .expect("version assertion receiver should remain available");
+        while let Some(message) = third.next().await {
+            match message.expect("client message should be valid") {
+                Message::Close(_) => {
+                    let _ignored = third.close(None).await;
+                    break;
+                }
+                Message::Ping(payload) => {
+                    third
+                        .send(Message::Pong(payload))
+                        .await
+                        .expect("pong should send");
+                }
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn malformed_ping_oversize_and_reconnect_follow_the_wire_protocol() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should have an address");
+        let (version_sender, version_receiver) = oneshot::channel::<()>();
+        let server = tokio::spawn(run_reconnect_protocol_server(listener, version_sender));
+
+        let options = FbOptionsBuilder::new("valid-environment-secret")
+            .streaming_url(format!("ws://{address}"))
+            .disable_events(true)
+            .start_wait(Duration::from_secs(2))
+            .connect_timeout(Duration::from_secs(1))
+            .close_timeout(Duration::from_secs(1))
+            .keep_alive_interval(Duration::from_millis(20))
+            .reconnect_delays([Duration::from_millis(1)])
+            .max_ws_message_size(1_024)
+            .build()
+            .expect("options should build");
+        let client = tokio::task::spawn_blocking(move || FbClient::with_options(options))
+            .await
+            .expect("client construction task should finish");
+        time::timeout(Duration::from_secs(2), version_receiver)
+            .await
+            .expect("versioned reconnect should occur")
+            .expect("version assertion should complete");
+        let user = FbUser::builder("user-1").build();
+        assert!(client.bool_variation("reconnected-flag", &user, false));
 
         tokio::task::spawn_blocking(move || client.close())
             .await

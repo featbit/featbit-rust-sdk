@@ -447,4 +447,18 @@ mod tests {
             .expect_err("a string flag cannot resolve as boolean");
         assert_eq!(error.code, EvaluationErrorCode::TypeMismatch);
     }
+
+    #[tokio::test]
+    async fn closed_provider_reports_error_and_rejects_resolution() {
+        let provider = provider();
+        provider.client().close();
+        assert_eq!(provider.status(), ProviderStatus::Error);
+
+        let context = EvaluationContext::default().with_targeting_key("user-1");
+        let error = provider
+            .resolve_bool_value("enabled", &context)
+            .await
+            .expect_err("closed provider must reject resolution");
+        assert_eq!(error.code, EvaluationErrorCode::ProviderNotReady);
+    }
 }

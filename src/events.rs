@@ -1,19 +1,21 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use arc_swap::ArcSwapOption;
 use chrono::Utc;
-use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
-use parking_lot::Mutex;
-use reqwest::blocking::Client;
+use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError, TrySendError};
+use reqwest::Client;
 use reqwest::StatusCode;
 use serde::Serialize;
+use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
+use tokio::sync::watch;
 use url::Url;
 
 use crate::model::{FbUser, Variation};
 use crate::options::FbOptions;
 use crate::user_agent;
+use crate::worker::{WorkerThread, WorkerWait};
 
 const MAX_PUBLIC_WAIT: Duration = Duration::from_hours(8_760);
 
@@ -30,17 +32,32 @@ impl EventProcessor {
         }
 
         let (sender, receiver) = bounded(options.max_events_in_queue);
+        let (shutdown_sender, shutdown_receiver) = bounded(2);
+        let (abort_sender, abort_receiver) = watch::channel(false);
         let worker_config = EventWorkerConfig::from_options(options);
-        let worker = thread::Builder::new()
-            .name("featbit-event-processor".to_owned())
-            .spawn(move || EventWorker::new(worker_config).run(&receiver));
+        let worker = WorkerThread::spawn("event processor", move || {
+            let runtime = RuntimeBuilder::new_current_thread().enable_all().build();
+            match runtime {
+                Ok(runtime) => EventWorker::new(worker_config).run(
+                    &runtime,
+                    &receiver,
+                    &shutdown_receiver,
+                    abort_receiver,
+                ),
+                Err(error) => {
+                    log::error!("failed to start FeatBit event runtime: {error}");
+                }
+            }
+        });
 
         match worker {
             Ok(worker) => Self::Active(Arc::new(EventProcessorInner {
-                sender,
+                sender: ArcSwapOption::from(Some(Arc::new(sender))),
+                shutdown_sender,
+                abort_sender,
                 closed: AtomicBool::new(false),
                 capacity_exceeded: AtomicBool::new(false),
-                worker: Mutex::new(Some(worker)),
+                worker,
                 flush_timeout: options.flush_timeout,
             })),
             Err(error) => {
@@ -86,16 +103,23 @@ impl EventProcessor {
             return false;
         }
 
-        if inner.sender.try_send(EventMessage::Payload(event)).is_ok() {
-            inner.capacity_exceeded.store(false, Ordering::Release);
-            true
-        } else {
-            if !inner.capacity_exceeded.swap(true, Ordering::AcqRel) {
-                log::warn!(
-                    "FeatBit events are being produced faster than they can be processed; events will be dropped"
-                );
+        let Some(sender) = inner.sender.load_full() else {
+            return false;
+        };
+        match sender.try_send(EventMessage::Payload(event)) {
+            Ok(()) => {
+                inner.capacity_exceeded.store(false, Ordering::Release);
+                true
             }
-            false
+            Err(TrySendError::Full(_)) => {
+                if !inner.capacity_exceeded.swap(true, Ordering::AcqRel) {
+                    log::warn!(
+                        "FeatBit events are being produced faster than they can be processed; events will be dropped"
+                    );
+                }
+                false
+            }
+            Err(TrySendError::Disconnected(_)) => false,
         }
     }
 
@@ -104,7 +128,9 @@ impl EventProcessor {
             return;
         };
         if !inner.closed.load(Ordering::Acquire) {
-            let _ignored = inner.sender.try_send(EventMessage::Flush(None));
+            if let Some(sender) = inner.sender.load_full() {
+                let _ignored = sender.try_send(EventMessage::Flush(None));
+            }
         }
     }
 
@@ -121,8 +147,10 @@ impl EventProcessor {
             .checked_add(timeout)
             .unwrap_or_else(Instant::now);
         let (reply_sender, reply_receiver) = bounded(1);
-        if inner
-            .sender
+        let Some(sender) = inner.sender.load_full() else {
+            return false;
+        };
+        if sender
             .send_timeout(EventMessage::Flush(Some(reply_sender)), timeout)
             .is_err()
         {
@@ -144,42 +172,52 @@ impl EventProcessor {
 
 #[derive(Debug)]
 pub(crate) struct EventProcessorInner {
-    sender: Sender<EventMessage>,
+    sender: ArcSwapOption<Sender<EventMessage>>,
+    shutdown_sender: Sender<Shutdown>,
+    abort_sender: watch::Sender<bool>,
     closed: AtomicBool,
     capacity_exceeded: AtomicBool,
-    worker: Mutex<Option<JoinHandle<()>>>,
+    worker: WorkerThread,
     flush_timeout: Duration,
 }
 
 impl EventProcessorInner {
     fn close(&self) {
         if self.closed.swap(true, Ordering::AcqRel) {
+            let _ignored = self.worker.wait(Duration::ZERO);
             return;
         }
 
         let timeout = self.flush_timeout.min(MAX_PUBLIC_WAIT);
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .unwrap_or_else(Instant::now);
-        let (reply_sender, reply_receiver) = bounded(1);
-        let sent = self
-            .sender
-            .send_timeout(EventMessage::Close(reply_sender), timeout);
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .unwrap_or(Duration::ZERO);
-        let completed = sent.is_ok() && reply_receiver.recv_timeout(remaining).is_ok();
+        let abort_budget = (timeout / 4).min(Duration::from_millis(100));
+        let graceful_budget = timeout.saturating_sub(abort_budget);
 
-        let worker = self.worker.lock().take();
-        if completed {
-            if let Some(worker) = worker {
-                if worker.join().is_err() {
-                    log::warn!("FeatBit event processor stopped after a worker panic");
-                }
+        self.sender.store(None);
+        let _ignored = self.shutdown_sender.try_send(Shutdown::Graceful);
+
+        match self.worker.wait(graceful_budget) {
+            WorkerWait::Completed => return,
+            WorkerWait::Panicked => {
+                log::warn!("FeatBit event processor stopped after a worker panic");
+                return;
             }
-        } else {
-            log::warn!("FeatBit event processor did not close within the configured timeout");
-            drop(worker);
+            WorkerWait::TimedOut => {}
+        }
+
+        let _ignored = self.abort_sender.send(true);
+        let _ignored = self.shutdown_sender.try_send(Shutdown::Abort);
+        match self.worker.wait(abort_budget) {
+            WorkerWait::Completed => {
+                log::warn!(
+                    "FeatBit event processor exceeded its graceful flush budget and was cancelled"
+                );
+            }
+            WorkerWait::Panicked => {
+                log::warn!("FeatBit event processor stopped after a worker panic");
+            }
+            WorkerWait::TimedOut => {
+                log::warn!("FeatBit event processor did not close within the configured timeout");
+            }
         }
     }
 }
@@ -194,7 +232,12 @@ impl Drop for EventProcessorInner {
 enum EventMessage {
     Payload(PayloadEvent),
     Flush(Option<Sender<()>>),
-    Close(Sender<()>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Shutdown {
+    Graceful,
+    Abort,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -363,50 +406,104 @@ impl EventWorker {
         }
     }
 
-    fn run(mut self, receiver: &Receiver<EventMessage>) {
+    fn run(
+        mut self,
+        runtime: &Runtime,
+        receiver: &Receiver<EventMessage>,
+        shutdown: &Receiver<Shutdown>,
+        mut abort: watch::Receiver<bool>,
+    ) {
         log::debug!("FeatBit event processor started");
-        loop {
+        let mut closing = false;
+
+        'worker: loop {
+            match shutdown.try_recv() {
+                Ok(Shutdown::Graceful) => closing = true,
+                Ok(Shutdown::Abort) | Err(TryRecvError::Disconnected) => break,
+                Err(TryRecvError::Empty) => {}
+            }
+
+            if closing {
+                crossbeam_channel::select! {
+                    recv(shutdown) -> message => match message {
+                        Ok(Shutdown::Graceful) => {}
+                        Ok(Shutdown::Abort) | Err(_) => break 'worker,
+                    },
+                    recv(receiver) -> message => if let Ok(message) = message {
+                        if !self.process(message, runtime, &mut abort) {
+                            break 'worker;
+                        }
+                    } else {
+                        let _completed = self.flush(runtime, &mut abort);
+                        break 'worker;
+                    },
+                }
+                continue;
+            }
+
             let elapsed = self.last_flush.elapsed();
             let wait = self
                 .config
                 .auto_flush_interval
                 .checked_sub(elapsed)
                 .unwrap_or(Duration::ZERO);
-            match receiver.recv_timeout(wait) {
-                Ok(EventMessage::Payload(event)) => {
-                    if !self.delivery_stopped {
-                        self.buffer.push(event);
-                        if self.buffer.len() >= self.config.max_events_per_request {
-                            self.flush();
-                        }
+
+            crossbeam_channel::select! {
+                recv(shutdown) -> message => match message {
+                    Ok(Shutdown::Graceful) => closing = true,
+                    Ok(Shutdown::Abort) | Err(_) => break 'worker,
+                },
+                recv(receiver) -> message => if let Ok(message) = message {
+                    if !self.process(message, runtime, &mut abort) {
+                        break 'worker;
                     }
-                }
-                Ok(EventMessage::Flush(reply)) => {
-                    self.flush();
-                    if let Some(reply) = reply {
-                        let _ignored = reply.send(());
+                } else {
+                    let _completed = self.flush(runtime, &mut abort);
+                    break 'worker;
+                },
+                default(wait) => {
+                    if !self.flush(runtime, &mut abort) {
+                        break 'worker;
                     }
-                }
-                Ok(EventMessage::Close(reply)) => {
-                    self.flush();
-                    let _ignored = reply.send(());
-                    break;
-                }
-                Err(RecvTimeoutError::Timeout) => self.flush(),
-                Err(RecvTimeoutError::Disconnected) => {
-                    self.flush();
-                    break;
-                }
+                },
             }
         }
         log::debug!("FeatBit event processor stopped");
     }
 
-    fn flush(&mut self) {
+    fn process(
+        &mut self,
+        message: EventMessage,
+        runtime: &Runtime,
+        abort: &mut watch::Receiver<bool>,
+    ) -> bool {
+        match message {
+            EventMessage::Payload(event) => {
+                if !self.delivery_stopped {
+                    self.buffer.push(event);
+                    if self.buffer.len() >= self.config.max_events_per_request {
+                        return self.flush(runtime, abort);
+                    }
+                }
+                true
+            }
+            EventMessage::Flush(reply) => {
+                let completed = self.flush(runtime, abort);
+                if completed {
+                    if let Some(reply) = reply {
+                        let _ignored = reply.send(());
+                    }
+                }
+                completed
+            }
+        }
+    }
+
+    fn flush(&mut self, runtime: &Runtime, abort: &mut watch::Receiver<bool>) -> bool {
         self.last_flush = Instant::now();
         if self.buffer.is_empty() || self.delivery_stopped {
             self.buffer.clear();
-            return;
+            return true;
         }
 
         let events = std::mem::take(&mut self.buffer);
@@ -419,23 +516,32 @@ impl EventWorker {
                     continue;
                 }
             };
-            if self.send(&payload) == Delivery::Fatal {
-                self.delivery_stopped = true;
-                break;
+            match runtime.block_on(self.send(&payload, abort)) {
+                Delivery::Fatal => {
+                    self.delivery_stopped = true;
+                    break;
+                }
+                Delivery::Cancelled => return false,
+                Delivery::Succeeded | Delivery::Failed => {}
             }
         }
+        true
     }
 
-    fn send(&self, payload: &[u8]) -> Delivery {
+    async fn send(&self, payload: &[u8], abort: &mut watch::Receiver<bool>) -> Delivery {
         let Some(client) = &self.client else {
             return Delivery::Fatal;
         };
 
         for attempt in 0..self.config.max_attempts {
             if attempt > 0 {
-                thread::sleep(self.config.retry_interval);
+                tokio::select! {
+                    biased;
+                    () = wait_for_abort(abort) => return Delivery::Cancelled,
+                    () = tokio::time::sleep(self.config.retry_interval) => {}
+                }
             }
-            let response = client
+            let request = client
                 .post(self.config.endpoint.clone())
                 .header(
                     reqwest::header::AUTHORIZATION,
@@ -448,6 +554,11 @@ impl EventWorker {
                 )
                 .body(payload.to_vec())
                 .send();
+            let response = tokio::select! {
+                biased;
+                () = wait_for_abort(abort) => return Delivery::Cancelled,
+                response = request => response,
+            };
 
             match response {
                 Ok(response) if response.status().is_success() => return Delivery::Succeeded,
@@ -462,7 +573,10 @@ impl EventWorker {
                     }
                 }
                 Err(error) => {
-                    log::warn!("FeatBit event request failed: {error}");
+                    log::warn!(
+                        "FeatBit event request failed ({})",
+                        request_error_kind(&error)
+                    );
                 }
             }
         }
@@ -477,6 +591,30 @@ enum Delivery {
     Succeeded,
     Failed,
     Fatal,
+    Cancelled,
+}
+
+async fn wait_for_abort(abort: &mut watch::Receiver<bool>) {
+    loop {
+        if *abort.borrow() {
+            return;
+        }
+        if abort.changed().await.is_err() {
+            return;
+        }
+    }
+}
+
+fn request_error_kind(error: &reqwest::Error) -> &'static str {
+    if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connection error"
+    } else if error.is_body() {
+        "request body error"
+    } else {
+        "transport error"
+    }
 }
 
 fn is_recoverable(status: StatusCode) -> bool {
@@ -501,6 +639,11 @@ fn event_endpoint(base: &Url) -> Url {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{ErrorKind, Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Barrier;
+    use std::thread;
+
     use mockito::Matcher;
     use serde_json::Value;
 
@@ -511,6 +654,63 @@ mod tests {
             .name("Ada")
             .custom("country", "cn")
             .build()
+    }
+
+    fn scripted_http_server(
+        statuses: impl IntoIterator<Item = u16>,
+    ) -> (String, Receiver<Vec<u8>>, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("test listener should have an address");
+        let statuses = statuses.into_iter().collect::<Vec<_>>();
+        let (body_sender, bodies) = bounded(statuses.len());
+        let server = thread::spawn(move || {
+            for status in statuses {
+                let (mut stream, _peer) = listener.accept().expect("event request should connect");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .expect("test stream should configure a timeout");
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2_048];
+                let body = loop {
+                    let read = stream
+                        .read(&mut buffer)
+                        .expect("request should be readable");
+                    assert!(read > 0, "request ended before its body was complete");
+                    request.extend_from_slice(&buffer[..read]);
+                    let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
+                    else {
+                        continue;
+                    };
+                    let body_start = header_end + 4;
+                    let headers = std::str::from_utf8(&request[..header_end])
+                        .expect("request headers should be UTF-8");
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .expect("request should include content-length");
+                    if request.len() >= body_start + content_length {
+                        break request[body_start..body_start + content_length].to_vec();
+                    }
+                };
+                body_sender
+                    .send(body)
+                    .expect("test body receiver should remain available");
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                )
+                .expect("test response should write");
+                stream.flush().expect("test response should flush");
+            }
+        });
+        (format!("http://{address}"), bodies, server)
     }
 
     #[test]
@@ -575,5 +775,193 @@ mod tests {
         assert!(processor.flush_and_wait(Duration::from_secs(2)));
         processor.close();
         request.assert();
+    }
+
+    #[test]
+    fn full_queue_and_stalled_http_request_do_not_block_concurrent_close() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
+        listener
+            .set_nonblocking(true)
+            .expect("test listener should become nonblocking");
+        let address = listener
+            .local_addr()
+            .expect("test listener should have an address");
+        let (accepted_sender, accepted_receiver) = bounded(1);
+        let (server_stop_sender, server_stop_receiver) = bounded(1);
+        let server = thread::spawn(move || loop {
+            match listener.accept() {
+                Ok((_stream, _peer)) => {
+                    let _ignored = accepted_sender.send(());
+                    let _ignored = server_stop_receiver.recv_timeout(Duration::from_secs(5));
+                    break;
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    if server_stop_receiver.try_recv().is_ok() {
+                        break;
+                    }
+                    thread::yield_now();
+                }
+                Err(error) => panic!("test listener failed: {error}"),
+            }
+        });
+
+        let options = crate::options::FbOptionsBuilder::new("valid-secret")
+            .event_url(format!("http://{address}"))
+            .auto_flush_interval(Duration::from_mins(1))
+            .flush_timeout(Duration::from_millis(400))
+            .event_request_timeout(Duration::from_secs(30))
+            .max_events_in_queue(1)
+            .max_events_per_request(1)
+            .max_send_event_attempts(1)
+            .build()
+            .expect("options should build");
+        let processor = EventProcessor::new(&options);
+        let EventProcessor::Active(inner) = &processor else {
+            panic!("event processor should start");
+        };
+
+        assert!(processor.record_metric(&test_user(), "first", 1.0));
+        accepted_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("event request should reach the test server");
+        assert!(processor.record_metric(&test_user(), "queued", 2.0));
+        assert!(!processor.record_metric(&test_user(), "dropped", 3.0));
+
+        let barrier = Arc::new(Barrier::new(5));
+        let mut closers = Vec::new();
+        let started = Instant::now();
+        for _ in 0..4 {
+            let inner = Arc::clone(inner);
+            let barrier = Arc::clone(&barrier);
+            closers.push(thread::spawn(move || {
+                barrier.wait();
+                inner.close();
+            }));
+        }
+        barrier.wait();
+        for closer in closers {
+            closer.join().expect("close thread should not panic");
+        }
+
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(inner.closed.load(Ordering::Acquire));
+        assert!(inner.sender.load_full().is_none());
+        assert_eq!(
+            inner.worker.wait(Duration::from_secs(1)),
+            WorkerWait::Completed
+        );
+
+        let _ignored = server_stop_sender.send(());
+        server.join().expect("test server should stop");
+    }
+
+    #[test]
+    fn processor_splits_batches_at_the_configured_request_limit() {
+        let (event_url, bodies, server) = scripted_http_server([202, 202]);
+        let options = crate::options::FbOptionsBuilder::new("valid-secret")
+            .event_url(event_url)
+            .auto_flush_interval(Duration::from_mins(1))
+            .max_events_per_request(2)
+            .build()
+            .expect("options should build");
+        let processor = EventProcessor::new(&options);
+
+        for index in 0..3 {
+            assert!(processor.record_metric(&test_user(), &format!("event-{index}"), 1.0));
+        }
+        assert!(processor.flush_and_wait(Duration::from_secs(2)));
+        processor.close();
+        server.join().expect("test server should stop");
+
+        let first: Value = serde_json::from_slice(
+            &bodies
+                .recv_timeout(Duration::from_secs(1))
+                .expect("first batch should arrive"),
+        )
+        .expect("first batch should be JSON");
+        let second: Value = serde_json::from_slice(
+            &bodies
+                .recv_timeout(Duration::from_secs(1))
+                .expect("second batch should arrive"),
+        )
+        .expect("second batch should be JSON");
+        assert_eq!(first.as_array().map(Vec::len), Some(2));
+        assert_eq!(second.as_array().map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn graceful_close_drains_every_accepted_event() {
+        let (event_url, bodies, server) = scripted_http_server([202, 202]);
+        let options = crate::options::FbOptionsBuilder::new("valid-secret")
+            .event_url(event_url)
+            .auto_flush_interval(Duration::from_mins(1))
+            .flush_timeout(Duration::from_secs(2))
+            .max_events_per_request(2)
+            .build()
+            .expect("options should build");
+        let processor = EventProcessor::new(&options);
+
+        for index in 0..3 {
+            assert!(processor.record_metric(&test_user(), &format!("close-{index}"), 1.0));
+        }
+        processor.close();
+        server.join().expect("test server should stop");
+
+        let delivered = (0..2)
+            .map(|_| {
+                let body = bodies
+                    .recv_timeout(Duration::from_secs(1))
+                    .expect("close should deliver both batches");
+                serde_json::from_slice::<Value>(&body)
+                    .expect("batch should be JSON")
+                    .as_array()
+                    .map_or(0, Vec::len)
+            })
+            .sum::<usize>();
+        assert_eq!(delivered, 3);
+    }
+
+    #[test]
+    fn recoverable_failures_retry_and_unrecoverable_status_stops_delivery() {
+        let (retry_url, retry_bodies, retry_server) = scripted_http_server([500, 202]);
+        let retry_options = crate::options::FbOptionsBuilder::new("valid-secret")
+            .event_url(retry_url)
+            .auto_flush_interval(Duration::from_mins(1))
+            .max_events_per_request(1)
+            .max_send_event_attempts(2)
+            .send_event_retry_interval(Duration::from_millis(1))
+            .build()
+            .expect("retry options should build");
+        let retry_processor = EventProcessor::new(&retry_options);
+        assert!(retry_processor.record_metric(&test_user(), "retry", 1.0));
+        assert!(retry_processor.flush_and_wait(Duration::from_secs(2)));
+        retry_processor.close();
+        retry_server.join().expect("retry server should stop");
+        assert!(retry_bodies.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(retry_bodies.recv_timeout(Duration::from_secs(1)).is_ok());
+
+        let (fatal_url, fatal_bodies, fatal_server) = scripted_http_server([401]);
+        let fatal_options = crate::options::FbOptionsBuilder::new("valid-secret")
+            .event_url(fatal_url)
+            .auto_flush_interval(Duration::from_mins(1))
+            .max_events_per_request(1)
+            .build()
+            .expect("fatal options should build");
+        let fatal_processor = EventProcessor::new(&fatal_options);
+        assert!(fatal_processor.record_metric(&test_user(), "fatal", 1.0));
+        assert!(fatal_processor.flush_and_wait(Duration::from_secs(2)));
+        assert!(fatal_processor.record_metric(&test_user(), "discarded", 2.0));
+        assert!(fatal_processor.flush_and_wait(Duration::from_secs(2)));
+        fatal_processor.close();
+        fatal_server.join().expect("fatal server should stop");
+        assert!(fatal_bodies.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(fatal_bodies.try_recv().is_err());
+
+        assert!(is_recoverable(StatusCode::BAD_REQUEST));
+        assert!(is_recoverable(StatusCode::REQUEST_TIMEOUT));
+        assert!(is_recoverable(StatusCode::TOO_MANY_REQUESTS));
+        assert!(is_recoverable(StatusCode::INTERNAL_SERVER_ERROR));
+        assert!(!is_recoverable(StatusCode::UNAUTHORIZED));
+        assert!(!is_recoverable(StatusCode::NOT_FOUND));
     }
 }

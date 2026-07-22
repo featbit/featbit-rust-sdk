@@ -113,13 +113,7 @@ impl FbClient {
         let store = Arc::new(SnapshotStore::new());
         let status = if offline {
             if let Some(bootstrap) = &options.bootstrap {
-                match bootstrap.data.event_type.as_str() {
-                    "full" => store.populate(&bootstrap.data),
-                    "patch" => {
-                        store.patch(&bootstrap.data);
-                    }
-                    _ => {}
-                }
+                store.populate(&bootstrap.data);
             }
             Arc::new(StatusTracker::new(SyncStatus::Ready, true))
         } else {
@@ -285,7 +279,7 @@ impl FbClient {
     /// This inspection API does not emit evaluation events. Results are sorted by flag key.
     #[must_use]
     pub fn all_variations(&self, user: &FbUser) -> Vec<EvaluationDetail<String>> {
-        if self.inner.closed.load(Ordering::Acquire) || !self.initialized() {
+        if !self.evaluation_available() {
             return Vec::new();
         }
         let snapshot = self.inner.store.load();
@@ -312,7 +306,7 @@ impl FbClient {
 
     /// Records a custom metric without blocking on network I/O.
     pub fn track_value(&self, user: &FbUser, event_name: &str, numeric_value: f64) {
-        if !self.inner.closed.load(Ordering::Acquire) {
+        if self.evaluation_available() {
             self.inner
                 .event_processor
                 .record_metric(user, event_name, numeric_value);
@@ -384,7 +378,7 @@ impl FbClient {
         key: &str,
         user: &FbUser,
     ) -> Result<EvalResult, ClientEvaluationError> {
-        if self.inner.closed.load(Ordering::Acquire) || !self.initialized() {
+        if !self.evaluation_available() {
             return Err(ClientEvaluationError::NotReady);
         }
         let snapshot = self.inner.store.load();
@@ -397,6 +391,15 @@ impl FbClient {
             result.send_to_experiment,
         );
         Ok(result)
+    }
+
+    fn evaluation_available(&self) -> bool {
+        !self.inner.closed.load(Ordering::Acquire)
+            && self.initialized()
+            && matches!(
+                self.inner.status.status(),
+                SyncStatus::Ready | SyncStatus::Stale
+            )
     }
 }
 
@@ -412,17 +415,19 @@ struct ClientInner {
 
 impl ClientInner {
     fn close(&self) {
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return;
+        let first_close = !self.closed.swap(true, Ordering::AcqRel);
+        if first_close {
+            log::info!("closing FeatBit client");
         }
-        log::info!("closing FeatBit client");
         if let Some(synchronizer) = &self.synchronizer {
             synchronizer.close();
         } else {
             self.status.set(SyncStatus::Closed);
         }
         self.event_processor.close();
-        log::info!("FeatBit client closed");
+        if first_close {
+            log::info!("FeatBit client closed");
+        }
     }
 }
 
@@ -584,5 +589,29 @@ mod tests {
             closer.join().expect("close should finish");
         }
         assert_eq!(client.status(), ClientStatus::Closed);
+    }
+
+    #[test]
+    fn terminal_sync_status_never_evaluates_a_previously_ready_snapshot() {
+        let options = FbOptionsBuilder::new("valid-secret")
+            .offline(true)
+            .disable_events(true)
+            .bootstrap_json(READY_BOOTSTRAP)
+            .build()
+            .expect("offline options should build");
+        let client = FbClient::with_options(options);
+        let user = FbUser::builder("user").build();
+        assert!(client.bool_variation("enabled", &user, false));
+        assert!(client.initialized());
+
+        client.inner.status.set(SyncStatus::Closed);
+
+        let detail = client.bool_variation_detail("enabled", &user, false);
+        assert!(!detail.value);
+        assert_eq!(detail.kind, ReasonKind::ClientNotReady);
+        assert_eq!(client.status(), ClientStatus::Closed);
+        assert!(client.initialized(), "initialized records prior readiness");
+        assert!(client.all_variations(&user).is_empty());
+        client.close();
     }
 }
