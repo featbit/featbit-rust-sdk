@@ -287,10 +287,11 @@ The provider status maps `NotReady`, `Ready`, `Stale`, and terminal closed state
 ## Documentation and compatibility
 
 - All public types and methods need rustdoc with failure, fallback, lifecycle, and thread-safety behavior.
-- README flag-evaluation examples must use the OpenFeature client. FeatBit-specific tracking,
-  delivery-aware flush, status, and close examples may use explicit provider/client extensions when
-  OpenFeature does not standardize the operation. Also show logging setup, offline/bootstrap mode,
-  flush/close, and production TLS URLs.
+- README usage guidance must introduce direct `FbClient` flag evaluation and lifecycle best
+  practices first, then document the OpenFeature client/provider integration. Link to compiling
+  console and Axum examples for both paths. FeatBit-specific tracking, delivery-aware flush, status,
+  and close examples may use direct client/provider extensions. Also show logging setup,
+  offline/bootstrap mode, flush/close, and production TLS URLs.
 - Examples must compile in CI and use placeholders, never real secrets.
 - Use semantic versioning. Existing public names, defaults, event shapes, evaluation results, and reconnect behavior are compatibility surfaces.
 - Unknown JSON fields must remain accepted. Removing accepted fields/operators or changing rollout results is a breaking change.

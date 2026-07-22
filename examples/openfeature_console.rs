@@ -1,4 +1,5 @@
-//! Registers the `FeatBit` provider and evaluates one boolean flag through `OpenFeature`.
+//! Registers the `FeatBit` provider and evaluates one boolean flag through `OpenFeature` in a
+//! console application.
 
 use std::env;
 use std::error::Error;

@@ -1,39 +1,155 @@
-# FeatBit Rust Server SDK
+# FeatBit RUST SDK (OpenFeature Compatible)
 
-The FeatBit server-side SDK and [OpenFeature](https://openfeature.dev/) provider for Rust. It synchronizes feature-flag data over WebSocket, evaluates flags locally, and sends analytics events asynchronously.
-
-The crate uses Rust edition 2021 and supports Rust 1.95.0 or newer. Register one `FeatBitProvider` per FeatBit environment and evaluate flags through an OpenFeature client shared for the process lifetime.
-
-## Capabilities
-
-- validated, immutable `FbOptions` configuration;
-- full and incremental WebSocket data synchronization with reconnect and cached snapshots;
-- local targeting, segment, rule, and deterministic percentage-rollout evaluation;
-- bounded, non-blocking evaluation and custom-event processing;
-- boolean, integer, float, string, and JSON/struct values;
-- direct implementation of the OpenFeature Rust `FeatureProvider` trait;
-- deferred/manual evaluation-event tracking and custom metric events;
-- an optional OpenTelemetry semantic evaluation-event adapter;
-- standard Rust `log` facade integration;
-- thread-safe clients, bounded shutdown, and fallback-returning direct APIs.
+The FeatBit server-side SDK for Rust synchronizes feature flags in the background, evaluates them locally, and sends analytics events asynchronously. It uses Rust edition 2021 and supports Rust 1.95.0 or newer.
 
 ## Installation
 
 ```toml
 [dependencies]
 featbit-server-sdk = "0.1"
-open-feature = "0.3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
-# Choose the logger used by your application. This one is only an example.
+# The SDK uses the `log` facade. Your application chooses the logger.
 env_logger = "0.11"
 ```
 
 The package name uses hyphens in `Cargo.toml` and is imported as `featbit_server_sdk` in Rust code.
 
-## OpenFeature quick start
+## Quick start
 
-`FeatBitProvider` implements `open_feature::provider::FeatureProvider` directly; there is no second evaluation layer. OpenFeature is the recommended application-facing API.
+Create one `FbClient` per FeatBit environment and reuse it for the lifetime of the application:
+
+```rust,no_run
+use featbit_server_sdk::{FbClient, FbOptions, FbUser};
+
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    env_logger::init();
+
+    let options = FbOptions::builder(std::env::var("FEATBIT_ENV_SECRET")?)
+        .streaming_url(std::env::var("FEATBIT_STREAMING_URL")?)
+        .event_url(std::env::var("FEATBIT_EVENT_URL")?)
+        .build()?;
+    let client = FbClient::with_options(options);
+
+    let user = FbUser::builder("user-123")
+        .name("Ada")
+        .custom("country", "CN")
+        .build();
+    let enabled = client.bool_variation("new-checkout", &user, false);
+
+    if enabled {
+        // Run the new code path.
+    }
+
+    client.close();
+    Ok(())
+}
+```
+
+Use `wss://` and `https://` endpoints in production. The default `ws://localhost:5100` and `http://localhost:5100` endpoints are intended for local development.
+
+## FbClient best practices
+
+- Create one client per FeatBit environment during application startup. `FbClient` is cheap to clone; every clone shares the same synchronized snapshot and background workers.
+- Client construction can wait up to the configured `start_wait` for initial data. In async applications, construct it with `tokio::task::spawn_blocking` rather than blocking an async worker.
+- Evaluation is synchronous, local, and performs no network I/O. Value-only methods always return the supplied fallback on failure.
+- Use detail methods when you need the variation ID, reason, or an immutable event for deferred tracking.
+- Treat both `Ready` and `Stale` as able to serve flags. `Stale` means the last synchronized snapshot remains available while the connection recovers.
+- Call `close` after the application has drained in-flight work. Shutdown is bounded and idempotent; `flush_and_wait` is available when delivery confirmation is required.
+
+| Flag type | Value-only method | Method with diagnostics |
+| --- | --- | --- |
+| Boolean | `bool_variation` | `bool_variation_detail` |
+| Integer | `int_variation` | `int_variation_detail` |
+| Float | `float_variation` | `float_variation_detail` |
+| String | `string_variation` | `string_variation_detail` |
+| JSON | `json_variation` | `json_variation_detail` |
+
+### Deferred evaluation and metric events
+
+For application-controlled exposure tracking, disable automatic evaluation events but keep explicit tracking enabled:
+
+```rust,no_run
+use featbit_server_sdk::FbOptions;
+
+# fn example() -> Result<(), featbit_server_sdk::ConfigError> {
+let options = FbOptions::builder("environment-secret")
+    .disable_events(
+        true, // disable automatic evaluation events
+        true, // allow explicit evaluation and metric tracking
+    )
+    .build()?;
+# let _ = options;
+# Ok(())
+# }
+```
+
+A successful detail result retains the exact evaluation event. Track it only after the result becomes a real exposure:
+
+```rust,no_run
+use featbit_server_sdk::{FbClient, FbUser};
+
+# fn user_was_exposed() -> bool { true }
+# fn example(client: &FbClient, user: &FbUser) {
+let detail = client.bool_variation_detail("new-checkout", user, false);
+if user_was_exposed() {
+    if let Some(event) = detail.evaluation_event.as_ref() {
+        let _accepted = client.track_eval_event(user, event);
+    }
+}
+
+let _accepted = client.track_metric_event(user, "checkout-completed", 1.0);
+# }
+```
+
+`disable_events(disable, allow_track)` controls event behavior:
+
+| Configuration | Automatic evaluation events | Explicit evaluation/metric tracking |
+| --- | --- | --- |
+| `disable_events(false, true)` (SDK default) | enabled | allowed |
+| `disable_events(false, false)` | enabled | rejected |
+| `disable_events(true, true)` (recommended deferred mode) | disabled | allowed |
+| `disable_events(true, false)` | disabled | rejected; event processor is not started |
+
+## FbClient examples
+
+### Console
+
+[`examples/fbclient_console.rs`](examples/fbclient_console.rs) evaluates a boolean flag with `FbClient`, prints the variation and reason, and closes the client.
+
+```text
+cargo run --example fbclient_console
+```
+
+### Axum
+
+[`examples/fbclient_axum.rs`](examples/fbclient_axum.rs) creates one client during startup, shares clones through typed Axum state, exposes readiness, and closes after in-flight requests drain.
+
+```text
+cargo run --example fbclient_axum
+```
+
+The Axum example listens on `127.0.0.1:3000` by default. Override it with `AXUM_BIND_ADDRESS` and configure logging with `RUST_LOG`.
+
+```bash
+curl --request POST http://127.0.0.1:3000/api/flags/new-checkout/evaluate \
+  --header 'content-type: application/json' \
+  --data '{"targetingKey":"user-123","name":"Ada","attributes":{"country":"CN"},"defaultValue":false}'
+```
+
+Readiness is available at `GET /health/ready`.
+
+## OpenFeature
+
+`FeatBitProvider` implements the official `open_feature::provider::FeatureProvider` interface. Applications evaluate flags through an OpenFeature `Client`; FeatBit continues to own synchronization, local evaluation, event delivery, and lifecycle.
+
+Add the OpenFeature and Tokio dependencies:
+
+```toml
+[dependencies]
+featbit-server-sdk = "0.1"
+open-feature = "0.3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+```
 
 ```rust,no_run
 use featbit_server_sdk::{FbOptions, FeatBitProvider};
@@ -47,19 +163,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .streaming_url(std::env::var("FEATBIT_STREAMING_URL")?)
         .event_url(std::env::var("FEATBIT_EVENT_URL")?)
         .build()?;
-
-    // Initial synchronization may wait for a bounded period, so initialize outside Tokio's
-    // asynchronous worker threads.
     let provider =
         tokio::task::spawn_blocking(move || FeatBitProvider::new(options)).await?;
-    let extensions = provider.clone();
+    let featbit = provider.client().clone();
 
     let client = {
         let mut api = OpenFeature::singleton_mut().await;
         api.set_provider(provider).await;
         api.create_client()
     };
-
     let context = EvaluationContext::default()
         .with_targeting_key("user-123")
         .with_custom_field("name", "Ada")
@@ -74,18 +186,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     OpenFeature::singleton_mut().await.shutdown().await;
-    tokio::task::spawn_blocking(move || extensions.client().close()).await?;
+    tokio::task::spawn_blocking(move || featbit.close()).await?;
     Ok(())
 }
 ```
 
-OpenFeature requires a non-empty targeting key. Provider failures use standard OpenFeature error codes such as `ProviderNotReady`, `FlagNotFound`, `TargetingKeyMissing`, `TypeMismatch`, and `ParseError`. Use `get_bool_details`, `get_int_details`, `get_float_details`, `get_string_details`, or `get_struct_details` when the reason and selected variant are needed.
+OpenFeature requires a non-empty targeting key. Provider failures use standard codes such as `ProviderNotReady`, `FlagNotFound`, `TargetingKeyMissing`, `TypeMismatch`, and `ParseError`. Use detail methods when the reason and selected variant are needed.
 
-## FeatBit-specific extensions
+### OpenFeature console example
 
-All flag resolution should use the OpenFeature client. OpenFeature 0.3 does not standardize custom
-metric events, delivery-aware flush, readiness details, or explicit bounded close, so keep a clone of
-`FeatBitProvider` only when the application needs those FeatBit-specific extensions:
+[`examples/openfeature_console.rs`](examples/openfeature_console.rs) registers `FeatBitProvider`, creates an OpenFeature client, evaluates one boolean flag, and shuts down cleanly.
+
+```text
+cargo run --example openfeature_console
+```
+
+### OpenFeature Axum example
+
+[`examples/openfeature_axum.rs`](examples/openfeature_axum.rs) shares an OpenFeature `Client` in typed Axum state and retains `FeatBitProvider` for readiness and shutdown operations. It exposes the same HTTP contract as the `FbClient` Axum example.
+
+```text
+cargo run --example openfeature_axum
+```
+
+OpenFeature 0.3 does not standardize custom metrics, delivery-aware flush, readiness details, or explicit bounded close. Keep a provider handle when these FeatBit-specific operations are required:
 
 ```rust,no_run
 use std::time::Duration;
@@ -105,168 +229,46 @@ let _delivered = provider
 # }
 ```
 
-`flush_and_wait` returns `true` only when every event covered by that flush was delivered (or event
-processing is disabled). Timeouts, exhausted retries, unrecoverable HTTP responses, stopped workers,
-and concurrent shutdown return `false`.
-
-The provider extensions use the same OpenFeature `EvaluationContext` mapping as flag resolution.
-The direct variation methods remain available for compatibility and specialized integrations, but
-README examples intentionally use OpenFeature for application-facing evaluation.
-
-### Deferred evaluation and metric events
-
-The recommended event configuration defers evaluation-event delivery until an OpenFeature
-resolution becomes a real exposure. Disable automatic evaluation events, keep explicit tracking
-available, and call the provider tracking extension only after exposure:
-
-```rust,no_run
-use std::time::Duration;
-
-use featbit_server_sdk::{FbOptions, FeatBitProvider};
-use open_feature::{EvaluationContext, OpenFeature};
-
-# async fn example() -> Result<(), Box<dyn std::error::Error>> {
-let options = FbOptions::builder("environment-secret")
-    .disable_events(
-        true, // disable automatic evaluation events for deferred exposure tracking
-        true, // allow explicit evaluation and metric tracking
-    )
-    .build()?;
-let provider = FeatBitProvider::new(options);
-let extensions = provider.clone();
-let client = {
-    let mut api = OpenFeature::singleton_mut().await;
-    api.set_provider(provider).await;
-    api.create_client()
-};
-let context = EvaluationContext::default().with_targeting_key("user-123");
-
-let detail = client
-    .get_bool_details("new-checkout", Some(&context), None)
-    .await?;
-if user_was_exposed_to_the_result() {
-    let _accepted = extensions
-        .track_eval_event_for_flag(&context, &detail.flag_key)?;
-}
-
-let _accepted = extensions
-    .track_metric_event(&context, "checkout-completed", 1.0)?;
-let _delivered = extensions
-    .client()
-    .flush_and_wait(Duration::from_secs(2));
-OpenFeature::singleton_mut().await.shutdown().await;
-# extensions.client().close();
-# Ok(())
-# }
-# fn user_was_exposed_to_the_result() -> bool { true }
-```
-
-`track_eval_event_for_flag` re-evaluates against the current snapshot because OpenFeature 0.3 details
-cannot carry a provider-specific event token. Call it promptly after resolution; an intervening flag
-update can change the variation recorded by the event.
-
-`disable_events(disable, allow_track)` is the single event-mode setting:
-
-| Configuration | Automatic evaluation events | Explicit evaluation/metric tracking |
-| --- | --- | --- |
-| `disable_events(false, true)` (SDK default) | enabled | allowed |
-| `disable_events(false, false)` | enabled | rejected |
-| `disable_events(true, true)` (recommended deferred mode) | disabled | allowed |
-| `disable_events(true, false)` | disabled | rejected; event processor is not started |
+`FeatBitProvider::track_eval_event_for_flag` re-evaluates the current snapshot because OpenFeature details cannot carry the immutable FeatBit event. Call it promptly after resolution when explicit evaluation tracking is needed.
 
 ## OpenTelemetry evaluation events
 
-The separate `featbit-server-sdk-opentelemetry` crate implements `EvaluationObserver` without adding
-OpenTelemetry dependencies to the core SDK. It emits the semantic event `feature_flag.evaluation`
-through an application-owned OpenTelemetry logger. Configure that logger with a batch processor so
-exporter I/O never runs on an evaluation thread:
+The optional `featbit-server-sdk-opentelemetry` crate emits `feature_flag.evaluation` through an application-owned OpenTelemetry logger. It excludes context identifiers and raw variation values by default and remains independent of FeatBit analytics delivery.
 
-```toml
-[dependencies]
-featbit-server-sdk = "0.1"
-featbit-server-sdk-opentelemetry = "0.1"
-opentelemetry = { version = "0.32", features = ["logs", "trace"] }
-```
-
-```rust,ignore
-use featbit_server_sdk::{FbOptions, FeatBitProvider};
-use featbit_server_sdk_opentelemetry::OpenTelemetryEvaluationObserver;
-use open_feature::OpenFeature;
-use opentelemetry::logs::LoggerProvider as _;
-
-// The application owns and configures this provider and its OTLP exporter.
-let logger = logger_provider.logger("featbit-server-sdk");
-let observer = OpenTelemetryEvaluationObserver::new(logger);
-let options = FbOptions::builder("environment-secret")
-    .evaluation_observer(observer)
-    .build()?;
-let provider = FeatBitProvider::new(options);
-OpenFeature::singleton_mut().await.set_provider(provider).await;
-```
-
-Context identifiers and raw variation values are excluded by default. They can be enabled explicitly
-with `with_context_id(true)` and `with_value(true)`. The adapter remains active independently of
-FeatBit analytics settings and never invokes `track_eval_event` or `track_metric_event`, so it cannot
-duplicate events sent to the FeatBit server. Failed OpenFeature resolutions, including missing
-targeting keys, parse errors, type mismatches, and unknown flags, are emitted with the corresponding
-standard `error.type` instead of a successful result variant.
-
-## Axum web application
-
-[`examples/axum.rs`](examples/axum.rs) shows the recommended Axum integration pattern:
-
-- construct and register one `FeatBitProvider` during application startup;
-- share an OpenFeature `Client` in typed Axum `State`;
-- build an OpenFeature `EvaluationContext` from each request and call `get_bool_details` inside the handler;
-- keep the FeatBit provider handle only for readiness and lifecycle extensions;
-- expose readiness without treating a reconnecting client as unable to serve cached flags;
-- drain in-flight HTTP requests, then flush and close the SDK during graceful shutdown;
-- bridge the SDK's `log` records into `tracing` and add Tower HTTP request tracing.
-
-Set `FEATBIT_ENV_SECRET`, `FEATBIT_STREAMING_URL`, and `FEATBIT_EVENT_URL`, then run:
-
-```text
-cargo run --example axum
-```
-
-The example listens on `127.0.0.1:3000` by default. Override it with `AXUM_BIND_ADDRESS` and configure logging with `RUST_LOG`. Evaluate a boolean flag with:
-
-```bash
-curl --request POST http://127.0.0.1:3000/api/flags/new-checkout/evaluate \
-  --header 'content-type: application/json' \
-  --data '{"targetingKey":"user-123","name":"Ada","attributes":{"country":"CN"},"defaultValue":false}'
-```
+See [`integrations/opentelemetry/README.md`](integrations/opentelemetry/README.md) for setup and privacy options.
 
 ## Offline bootstrap
 
-Offline mode performs no network I/O and can initialize from a FeatBit full data-sync envelope:
+Offline mode performs no network I/O and initializes `FbClient` from a FeatBit full data-sync envelope:
 
 ```rust,no_run
-use featbit_server_sdk::{FbOptions, FeatBitProvider};
-use open_feature::OpenFeature;
+use featbit_server_sdk::{FbClient, FbOptions, FeatBitProvider};
 
-# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+# fn example() -> Result<(), Box<dyn std::error::Error>> {
 let bootstrap = std::fs::read_to_string("featbit-bootstrap.json")?;
 let options = FbOptions::builder("offline-placeholder")
     .offline(true)
     .disable_events(true, false)
     .bootstrap_json(bootstrap)
     .build()?;
-let provider = FeatBitProvider::new(options);
-OpenFeature::singleton_mut().await.set_provider(provider).await;
-# Ok::<(), Box<dyn std::error::Error>>(())
+let client = FbClient::with_options(options);
+
+// Use the client directly, or expose the same snapshot through OpenFeature.
+let provider = FeatBitProvider::from_client(client.clone());
+# let _ = provider;
+# Ok(())
 # }
 ```
 
-Bootstrap JSON is deliberately restricted to offline mode so static data cannot silently compete with the live synchronizer.
+Bootstrap JSON is restricted to offline mode so static data cannot compete with the live synchronizer.
 
 ## Configuration and lifecycle
 
-Defaults match the FeatBit .NET server SDK where practical: local endpoints, a 5-second initial wait, a 3-second connection timeout, 15-second keepalive, a 10,000-event queue, 50 events per request, and a 5-second auto-flush interval. Configure production deployments with `wss://` and `https://` endpoints. Endpoint base paths are supported, but credentials, query parameters, and fragments are rejected because the SDK supplies its own authentication and protocol query parameters.
+Defaults match the FeatBit .NET server SDK where practical: a 5-second initial wait, a 3-second connection timeout, 15-second keepalive, a 10,000-event queue, 50 events per request, and a 5-second auto-flush interval.
 
-The OpenFeature provider reports `NotReady`, `Ready`, `Stale`, or `Error`; `provider.client().status()` exposes the more specific FeatBit lifecycle state when operational health checks need it. Evaluation remains local and lock-free on the read path. Network failures are logged and retried in background workers. Event queues are bounded, so analytics can be dropped under sustained overload rather than delaying application requests.
+`FbClient` reports `NotReady`, `Ready`, `Stale`, or `Closed`; `FeatBitProvider` maps those states into OpenFeature provider status. Network failures are logged and retried by background workers. Event queues are bounded, so analytics can be dropped under sustained overload rather than delaying application requests.
 
-The SDK uses the `log` facade and never installs a logger. Configure `env_logger`, `tracing-log`, or another logger in the application. Environment secrets are redacted from SDK `Debug` output and are never written to SDK logs.
+The SDK uses the `log` facade and never installs a logger. Environment secrets are redacted from SDK `Debug` output and are never written to SDK logs.
 
 ## Development
 
@@ -279,10 +281,7 @@ cargo test --workspace --all-features
 cargo test --workspace --doc
 ```
 
-The explicitly authorized, bounded FeatBit Cloud stress project is documented in
-[`examples/test/README.md`](examples/test/README.md). It exercises live updates through a local
-Axum application and the OpenFeature API, deferred FeatBit event delivery, and OpenTelemetry
-evaluation events without storing credentials in the repository.
+The bounded FeatBit Cloud stress project is documented in [`examples/test/README.md`](examples/test/README.md).
 
 ## License
 
