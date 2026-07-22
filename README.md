@@ -105,6 +105,10 @@ let _delivered = provider
 # }
 ```
 
+`flush_and_wait` returns `true` only when every event covered by that flush was delivered (or event
+processing is disabled). Timeouts, exhausted retries, unrecoverable HTTP responses, stopped workers,
+and concurrent shutdown return `false`.
+
 The provider extensions use the same OpenFeature `EvaluationContext` mapping as flag resolution.
 The direct variation methods remain available for compatibility and specialized integrations, but
 README examples intentionally use OpenFeature for application-facing evaluation.
@@ -203,7 +207,9 @@ OpenFeature::singleton_mut().await.set_provider(provider).await;
 Context identifiers and raw variation values are excluded by default. They can be enabled explicitly
 with `with_context_id(true)` and `with_value(true)`. The adapter remains active independently of
 FeatBit analytics settings and never invokes `track_eval_event` or `track_metric_event`, so it cannot
-duplicate events sent to the FeatBit server.
+duplicate events sent to the FeatBit server. Failed OpenFeature resolutions, including missing
+targeting keys, parse errors, type mismatches, and unknown flags, are emitted with the corresponding
+standard `error.type` instead of a successful result variant.
 
 ## Axum web application
 
@@ -275,7 +281,8 @@ cargo test --workspace --doc
 
 The explicitly authorized, bounded FeatBit Cloud stress project is documented in
 [`examples/test/README.md`](examples/test/README.md). It exercises live updates through a local
-Axum application and the OpenFeature API without storing credentials in the repository.
+Axum application and the OpenFeature API, deferred FeatBit event delivery, and OpenTelemetry
+evaluation events without storing credentials in the repository.
 
 ## License
 

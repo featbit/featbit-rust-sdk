@@ -135,6 +135,13 @@ mod tests {
             "fallthrough":{"includedInExpt":false,"variations":[
                 {"id":"on","rollout":[0,1],"exptRollout":0}
             ]}
+        },{
+            "id":"invalid-flag-id","key":"invalid-bool","updatedAt":1,"variationType":"boolean",
+            "variations":[{"id":"invalid","value":"not-a-boolean"}],
+            "targetUsers":[],"rules":[],"isEnabled":true,
+            "fallthrough":{"includedInExpt":false,"variations":[
+                {"id":"invalid","rollout":[0,1],"exptRollout":0}
+            ]}
         }],"segments":[]}
     }"#;
 
@@ -234,11 +241,12 @@ mod tests {
 
         assert!(client.bool_variation("enabled", &user, false));
         assert!(!client.bool_variation("missing", &user, false));
+        assert!(client.bool_variation("invalid-bool", &user, true));
 
         let records = records
             .lock()
             .expect("test logger lock should remain available");
-        assert_eq!(records.len(), 2);
+        assert_eq!(records.len(), 3);
         let record = &records[0];
         assert_eq!(record.event_name, Some(EVENT_NAME));
         assert_eq!(record.severity, Some(Severity::Info));
@@ -261,6 +269,13 @@ mod tests {
             records[1].attributes.get("feature_flag.result.reason"),
             Some(&AnyValue::from("error"))
         );
+        assert_eq!(
+            records[2].attributes.get("error.type"),
+            Some(&AnyValue::from("type_mismatch"))
+        );
+        assert!(!records[2]
+            .attributes
+            .contains_key("feature_flag.result.variant"));
         client.close();
     }
 }

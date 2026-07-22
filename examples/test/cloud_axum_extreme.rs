@@ -6,21 +6,25 @@
 //! exactly equals `FEATBIT_ENVIRONMENT_ID`. Credentials are read from environment variables and
 //! are never persisted or printed.
 
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::error::Error;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use featbit_server_sdk::{ClientStatus, FbOptions, FeatBitProvider, SDK_VERSION};
+use featbit_server_sdk::{ClientStatus, FbOptions, FbUser, FeatBitProvider, SDK_VERSION};
+use featbit_server_sdk_opentelemetry::OpenTelemetryEvaluationObserver;
 use open_feature::{Client as OpenFeatureClient, EvaluationContext, OpenFeature};
+use opentelemetry::logs::{AnyValue, LogRecord, Logger, Severity};
+use opentelemetry::Key;
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use reqwest::{Client as HttpClient, Method, Url};
 use serde::{Deserialize, Serialize};
@@ -41,6 +45,9 @@ const CONCURRENT_UPDATE_BURST: usize = 16;
 const ROLLOUT_USERS: usize = 400;
 const ROLLOUT_REPEAT_USERS: usize = 40;
 const SYNC_TIMEOUT: Duration = Duration::from_secs(15);
+const EVENT_FLUSH_TIMEOUT: Duration = Duration::from_secs(10);
+const OTEL_EVENT_NAME: &str = "feature_flag.evaluation";
+const OTEL_TARGET: &str = "featbit-server-sdk";
 
 #[tokio::main]
 async fn main() -> TestResult<()> {
@@ -65,14 +72,19 @@ async fn main() -> TestResult<()> {
 
     let report = result?;
     println!(
-        "cloud Axum/OpenFeature test passed: flag={}, updates={}, evaluations={}, maxLatencyMs={}, rolloutOn={}, rolloutOff={}, finalSyncMs={}",
+        "cloud Axum/OpenFeature test passed: flag={}, updates={}, evaluations={}, maxLatencyMs={}, rolloutOn={}, rolloutOff={}, finalSyncMs={}, automaticEventFlushMs={}, explicitEvents={}, explicitEventFlushMs={}, otelEvents={}, otelErrors={}",
         flag.key,
         report.updates,
         report.evaluations,
         report.max_latency.as_millis(),
         report.rollout_on,
         report.rollout_off,
-        report.final_sync_latency.as_millis()
+        report.final_sync_latency.as_millis(),
+        report.automatic_event_flush_latency.as_millis(),
+        report.explicit_events,
+        report.event_flush_latency.as_millis(),
+        report.otel_events,
+        report.otel_errors
     );
     Ok(())
 }
@@ -390,6 +402,207 @@ fn random_uuid() -> String {
     )
 }
 
+#[derive(Clone, Default)]
+struct TestOtelLogger {
+    aggregate: Arc<Mutex<OtelAggregate>>,
+}
+
+impl TestOtelLogger {
+    fn validate(&self, flag: &TestFlag, minimum_events: usize) -> TestResult<OtelReport> {
+        let aggregate = match self.aggregate.lock() {
+            Ok(aggregate) => aggregate,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if aggregate.invalid_schema != 0 {
+            return Err(failure(format!(
+                "OpenTelemetry emitted {} records with an invalid semantic shape",
+                aggregate.invalid_schema
+            )));
+        }
+        if aggregate.privacy_violations != 0 {
+            return Err(failure(
+                "OpenTelemetry default attributes exposed a context ID or raw variation value",
+            ));
+        }
+        if aggregate.events < minimum_events || aggregate.successes == 0 {
+            return Err(failure(format!(
+                "OpenTelemetry observed too few successful evaluations: total={}, minimum={minimum_events}",
+                aggregate.events
+            )));
+        }
+        if aggregate.errors == 0 || !aggregate.error_types.contains("flag_not_found") {
+            return Err(failure(
+                "OpenTelemetry did not emit the archived flag-not-found evaluation error",
+            ));
+        }
+        if aggregate.flag_keys.len() != 1 || !aggregate.flag_keys.contains(&flag.key) {
+            return Err(failure(
+                "OpenTelemetry emitted an evaluation for an unexpected feature flag",
+            ));
+        }
+        Ok(OtelReport {
+            events: aggregate.events,
+            errors: aggregate.errors,
+        })
+    }
+}
+
+impl Logger for TestOtelLogger {
+    type LogRecord = TestOtelLogRecord;
+
+    fn create_log_record(&self) -> Self::LogRecord {
+        TestOtelLogRecord::default()
+    }
+
+    fn emit(&self, record: Self::LogRecord) {
+        let mut aggregate = match self.aggregate.lock() {
+            Ok(aggregate) => aggregate,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        aggregate.events += 1;
+
+        let event_name_valid = record.event_name == Some(OTEL_EVENT_NAME);
+        let target_valid = record.target.as_deref() == Some(OTEL_TARGET);
+        let timestamp_valid = record.timestamp.is_some();
+        let severity_valid = record.severity == Some(Severity::Info)
+            && record.severity_text == Some("INFO")
+            && !record.body_set;
+        let provider_valid =
+            attribute_string(&record.attributes, "feature_flag.provider.name") == Some("FeatBit");
+        let reason_valid =
+            attribute_string(&record.attributes, "feature_flag.result.reason").is_some();
+        let experiment_valid = matches!(
+            record
+                .attributes
+                .get("featbit.evaluation.send_to_experiment"),
+            Some(AnyValue::Boolean(_))
+        );
+
+        let flag_key = attribute_string(&record.attributes, "feature_flag.key");
+        if let Some(flag_key) = flag_key {
+            aggregate.flag_keys.insert(flag_key.to_owned());
+        }
+        if let Some(error_type) = attribute_string(&record.attributes, "error.type") {
+            aggregate.errors += 1;
+            aggregate.error_types.insert(error_type.to_owned());
+        } else if record
+            .attributes
+            .contains_key("feature_flag.result.variant")
+        {
+            aggregate.successes += 1;
+        } else {
+            aggregate.invalid_schema += 1;
+        }
+
+        if record.attributes.contains_key("feature_flag.context.id")
+            || record.attributes.contains_key("feature_flag.result.value")
+        {
+            aggregate.privacy_violations += 1;
+        }
+        if !(event_name_valid
+            && target_valid
+            && timestamp_valid
+            && severity_valid
+            && provider_valid
+            && reason_valid
+            && experiment_valid
+            && flag_key.is_some())
+        {
+            aggregate.invalid_schema += 1;
+        }
+    }
+
+    fn event_enabled(&self, _level: Severity, _target: &str, _name: Option<&str>) -> bool {
+        true
+    }
+}
+
+#[derive(Default)]
+struct TestOtelLogRecord {
+    event_name: Option<&'static str>,
+    target: Option<String>,
+    timestamp: Option<SystemTime>,
+    severity: Option<Severity>,
+    severity_text: Option<&'static str>,
+    body_set: bool,
+    attributes: BTreeMap<String, AnyValue>,
+}
+
+impl LogRecord for TestOtelLogRecord {
+    fn set_event_name(&mut self, name: &'static str) {
+        self.event_name = Some(name);
+    }
+
+    fn set_target<T>(&mut self, target: T)
+    where
+        T: Into<Cow<'static, str>>,
+    {
+        self.target = Some(target.into().into_owned());
+    }
+
+    fn set_timestamp(&mut self, timestamp: SystemTime) {
+        self.timestamp = Some(timestamp);
+    }
+
+    fn set_observed_timestamp(&mut self, _timestamp: SystemTime) {}
+
+    fn set_severity_text(&mut self, text: &'static str) {
+        self.severity_text = Some(text);
+    }
+
+    fn set_severity_number(&mut self, number: Severity) {
+        self.severity = Some(number);
+    }
+
+    fn set_body(&mut self, _body: AnyValue) {
+        self.body_set = true;
+    }
+
+    fn add_attributes<I, K, V>(&mut self, attributes: I)
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: Into<Key>,
+        V: Into<AnyValue>,
+    {
+        for (key, value) in attributes {
+            self.add_attribute(key, value);
+        }
+    }
+
+    fn add_attribute<K, V>(&mut self, key: K, value: V)
+    where
+        K: Into<Key>,
+        V: Into<AnyValue>,
+    {
+        let key = key.into();
+        self.attributes
+            .insert(key.as_str().to_owned(), value.into());
+    }
+}
+
+fn attribute_string<'a>(attributes: &'a BTreeMap<String, AnyValue>, key: &str) -> Option<&'a str> {
+    match attributes.get(key) {
+        Some(AnyValue::String(value)) => Some(value.as_str()),
+        _ => None,
+    }
+}
+
+#[derive(Default)]
+struct OtelAggregate {
+    events: usize,
+    successes: usize,
+    errors: usize,
+    invalid_schema: usize,
+    privacy_violations: usize,
+    flag_keys: BTreeSet<String>,
+    error_types: BTreeSet<String>,
+}
+
+struct OtelReport {
+    events: usize,
+    errors: usize,
+}
+
 #[derive(Clone)]
 struct AppState {
     flags: Arc<OpenFeatureClient>,
@@ -569,6 +782,11 @@ struct ScenarioReport {
     rollout_on: usize,
     rollout_off: usize,
     final_sync_latency: Duration,
+    automatic_event_flush_latency: Duration,
+    explicit_events: usize,
+    event_flush_latency: Duration,
+    otel_events: usize,
+    otel_errors: usize,
 }
 
 async fn run_application(
@@ -576,10 +794,14 @@ async fn run_application(
     api: &RestApi,
     flag: &TestFlag,
 ) -> TestResult<ScenarioReport> {
+    let otel_logger = TestOtelLogger::default();
+    let otel_inspector = otel_logger.clone();
+    let observer = OpenTelemetryEvaluationObserver::new(otel_logger);
     let options = FbOptions::builder(config.environment_secret.clone())
         .streaming_url(config.streaming_url.clone())
         .event_url(config.event_url.clone())
-        .disable_events(config.disable_events, !config.disable_events)
+        .disable_events(config.disable_events, false)
+        .evaluation_observer(observer)
         .start_wait(Duration::from_secs(10))
         .build()?;
     let provider = tokio::task::spawn_blocking(move || FeatBitProvider::new(options)).await?;
@@ -594,7 +816,10 @@ async fn run_application(
             "FeatBit provider did not initialize from the cloud",
         ));
     }
+
+    verify_tracking_is_disabled(&provider, flag)?;
     let featbit = provider.client().clone();
+    let analytics_client = featbit.clone();
     let flags = {
         let mut open_feature = OpenFeature::singleton_mut().await;
         open_feature.set_provider(provider.clone()).await;
@@ -608,7 +833,33 @@ async fn run_application(
         .pool_max_idle_per_host(config.evaluation_workers)
         .build()?;
 
-    let scenario = run_scenario(config, api, flag, &http, &evaluation_url).await;
+    let scenario = async {
+        let mut report = run_scenario(config, api, flag, &http, &evaluation_url).await?;
+        if !config.disable_events {
+            let flush_client = analytics_client.clone();
+            let flush_started = Instant::now();
+            let delivered = tokio::task::spawn_blocking(move || {
+                flush_client.flush_and_wait(EVENT_FLUSH_TIMEOUT)
+            })
+            .await?;
+            report.automatic_event_flush_latency = flush_started.elapsed();
+            if !delivered {
+                return Err(failure(
+                    "automatic evaluation events were not delivered to FeatBit",
+                ));
+            }
+        }
+        let event_probe = run_explicit_event_probe(config, flag).await?;
+        api.archive_flag(flag).await?;
+        wait_for_fallback(&http, &evaluation_url, &Probe::user("ordinary-user")).await?;
+        let otel = otel_inspector.validate(flag, report.evaluations)?;
+        report.explicit_events = event_probe.events;
+        report.event_flush_latency = event_probe.flush_latency;
+        report.otel_events = otel.events;
+        report.otel_errors = otel.errors;
+        TestResult::Ok(report)
+    }
+    .await;
     let application_stop = application.stop().await;
     OpenFeature::singleton_mut().await.shutdown().await;
     let client_close = tokio::task::spawn_blocking(move || featbit.close()).await;
@@ -617,6 +868,180 @@ async fn run_application(
     application_stop?;
     client_close?;
     Ok(report)
+}
+
+fn verify_tracking_is_disabled(provider: &FeatBitProvider, flag: &TestFlag) -> TestResult<()> {
+    let user = FbUser::builder("disabled-tracking-user")
+        .name("Disabled tracking probe")
+        .build();
+    let detail = provider
+        .client()
+        .bool_variation_detail(&flag.key, &user, false);
+    let event = detail
+        .evaluation_event
+        .as_ref()
+        .ok_or_else(|| failure("disabled tracking probe could not evaluate the live flag"))?;
+    validate_direct_detail(detail.value, &detail.variation_id, flag)?;
+    if provider.client().track_eval_event(&user, event) {
+        return Err(failure(
+            "track_eval_event was accepted even though allow_track is false",
+        ));
+    }
+    if provider
+        .client()
+        .track_metric_event(&user, "disabled-tracking-metric", 1.0)
+    {
+        return Err(failure(
+            "track_metric_event was accepted even though allow_track is false",
+        ));
+    }
+
+    let context = EvaluationContext::default().with_targeting_key("disabled-tracking-user");
+    if provider
+        .track_eval_event_for_flag(&context, &flag.key)
+        .map_err(|error| {
+            failure(format!(
+                "disabled OpenFeature evaluation tracking failed with {}",
+                error.code
+            ))
+        })?
+    {
+        return Err(failure(
+            "OpenFeature evaluation tracking was accepted while tracking is disabled",
+        ));
+    }
+    if provider
+        .track_metric_event(&context, "disabled-provider-metric", 1.0)
+        .map_err(|error| {
+            failure(format!(
+                "disabled OpenFeature metric tracking failed with {}",
+                error.code
+            ))
+        })?
+    {
+        return Err(failure(
+            "OpenFeature metric tracking was accepted while tracking is disabled",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_direct_detail(value: bool, variation_id: &str, flag: &TestFlag) -> TestResult<()> {
+    let expected_variation = if value {
+        flag.on_variation.as_str()
+    } else {
+        flag.off_variation.as_str()
+    };
+    if variation_id != expected_variation {
+        return Err(failure("direct detail returned a value/variation mismatch"));
+    }
+    Ok(())
+}
+
+struct EventProbeReport {
+    events: usize,
+    flush_latency: Duration,
+}
+
+async fn run_explicit_event_probe(
+    config: &TestConfig,
+    flag: &TestFlag,
+) -> TestResult<EventProbeReport> {
+    let options = FbOptions::builder(config.environment_secret.clone())
+        .streaming_url(config.streaming_url.clone())
+        .event_url(config.event_url.clone())
+        .disable_events(true, true)
+        .auto_flush_interval(Duration::from_secs(30))
+        .flush_timeout(EVENT_FLUSH_TIMEOUT)
+        .start_wait(Duration::from_secs(10))
+        .build()?;
+    let provider = tokio::task::spawn_blocking(move || FeatBitProvider::new(options)).await?;
+    if !provider.client().initialized()
+        || !matches!(
+            provider.client().status(),
+            ClientStatus::Ready | ClientStatus::Stale
+        )
+    {
+        provider.client().close();
+        return Err(failure(
+            "explicit event probe did not initialize from the cloud",
+        ));
+    }
+
+    let result = async {
+        let user = FbUser::builder("explicit-tracking-user")
+            .name("Explicit tracking probe")
+            .custom("testPhase", "explicit-events")
+            .build();
+        let detail = provider
+            .client()
+            .bool_variation_detail(&flag.key, &user, false);
+        validate_direct_detail(detail.value, &detail.variation_id, flag)?;
+        let event = detail
+            .evaluation_event
+            .as_ref()
+            .ok_or_else(|| failure("successful detail did not retain an evaluation event"))?;
+        if !provider.client().track_eval_event(&user, event) {
+            return Err(failure("track_eval_event rejected the retained live event"));
+        }
+        if !provider
+            .client()
+            .track_metric_event(&user, "codex-rust-sdk-explicit-metric", 42.0)
+        {
+            return Err(failure("track_metric_event rejected the live metric"));
+        }
+
+        let context = EvaluationContext::default()
+            .with_targeting_key("explicit-openfeature-user")
+            .with_custom_field("name", "Explicit OpenFeature tracking probe");
+        if !provider
+            .track_eval_event_for_flag(&context, &flag.key)
+            .map_err(|error| {
+                failure(format!(
+                    "OpenFeature evaluation tracking failed with {}",
+                    error.code
+                ))
+            })?
+        {
+            return Err(failure(
+                "OpenFeature tracking extension rejected the live evaluation event",
+            ));
+        }
+        if !provider
+            .track_metric_event(&context, "codex-rust-sdk-openfeature-metric", 7.0)
+            .map_err(|error| {
+                failure(format!(
+                    "OpenFeature metric tracking failed with {}",
+                    error.code
+                ))
+            })?
+        {
+            return Err(failure(
+                "OpenFeature tracking extension rejected the live metric event",
+            ));
+        }
+
+        let flush_client = provider.client().clone();
+        let flush_started = Instant::now();
+        let delivered =
+            tokio::task::spawn_blocking(move || flush_client.flush_and_wait(EVENT_FLUSH_TIMEOUT))
+                .await?;
+        let flush_latency = flush_started.elapsed();
+        if !delivered {
+            return Err(failure(
+                "explicit evaluation and metric events were not delivered to FeatBit",
+            ));
+        }
+        Ok(EventProbeReport {
+            events: 4,
+            flush_latency,
+        })
+    }
+    .await;
+
+    let close_client = provider.client().clone();
+    tokio::task::spawn_blocking(move || close_client.close()).await?;
+    result
 }
 
 async fn run_scenario(
@@ -673,9 +1098,6 @@ async fn run_scenario(
     wait_for_value(http, evaluation_url, &ordinary, true, &flag.on_variation).await?;
     let final_sync_latency = final_update.elapsed();
 
-    api.archive_flag(flag).await?;
-    wait_for_fallback(http, evaluation_url, &ordinary).await?;
-
     Ok(ScenarioReport {
         updates: config.update_count + CONCURRENT_UPDATE_BURST + 6,
         evaluations: load.evaluations + rollout_evaluations,
@@ -683,6 +1105,11 @@ async fn run_scenario(
         rollout_on,
         rollout_off,
         final_sync_latency,
+        automatic_event_flush_latency: Duration::ZERO,
+        explicit_events: 0,
+        event_flush_latency: Duration::ZERO,
+        otel_events: 0,
+        otel_errors: 0,
     })
 }
 

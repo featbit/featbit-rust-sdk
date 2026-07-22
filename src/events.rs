@@ -115,17 +115,20 @@ impl EventProcessor {
         let (sender, receiver) = bounded(options.max_events_in_queue);
         let (shutdown_sender, shutdown_receiver) = bounded(2);
         let (abort_sender, abort_receiver) = watch::channel(false);
+        let delivery_stopped = Arc::new(AtomicBool::new(false));
+        let worker_delivery_stopped = Arc::clone(&delivery_stopped);
         let worker_config = EventWorkerConfig::from_options(options);
         let worker = WorkerThread::spawn("event processor", move || {
             let runtime = RuntimeBuilder::new_current_thread().enable_all().build();
             match runtime {
-                Ok(runtime) => EventWorker::new(worker_config).run(
+                Ok(runtime) => EventWorker::new(worker_config, worker_delivery_stopped).run(
                     &runtime,
                     &receiver,
                     &shutdown_receiver,
                     abort_receiver,
                 ),
                 Err(error) => {
+                    worker_delivery_stopped.store(true, Ordering::Release);
                     log::error!("failed to start FeatBit event runtime: {error}");
                 }
             }
@@ -138,6 +141,7 @@ impl EventProcessor {
                 abort_sender,
                 closed: AtomicBool::new(false),
                 capacity_exceeded: AtomicBool::new(false),
+                delivery_stopped,
                 worker,
                 flush_timeout: options.flush_timeout,
             })),
@@ -176,7 +180,7 @@ impl EventProcessor {
         let Self::Active(inner) = self else {
             return false;
         };
-        if inner.closed.load(Ordering::Acquire) {
+        if inner.closed.load(Ordering::Acquire) || inner.delivery_stopped.load(Ordering::Acquire) {
             return false;
         }
 
@@ -216,7 +220,7 @@ impl EventProcessor {
             return true;
         };
         if inner.closed.load(Ordering::Acquire) {
-            return true;
+            return false;
         }
 
         let timeout = timeout.min(MAX_PUBLIC_WAIT);
@@ -236,7 +240,7 @@ impl EventProcessor {
         let remaining = deadline
             .checked_duration_since(Instant::now())
             .unwrap_or(Duration::ZERO);
-        reply_receiver.recv_timeout(remaining).is_ok()
+        reply_receiver.recv_timeout(remaining).unwrap_or(false)
     }
 
     pub(crate) fn close(&self) {
@@ -254,6 +258,7 @@ pub(crate) struct EventProcessorInner {
     abort_sender: watch::Sender<bool>,
     closed: AtomicBool,
     capacity_exceeded: AtomicBool,
+    delivery_stopped: Arc<AtomicBool>,
     worker: WorkerThread,
     flush_timeout: Duration,
 }
@@ -308,7 +313,7 @@ impl Drop for EventProcessorInner {
 #[derive(Debug)]
 enum EventMessage {
     Payload(PayloadEvent),
-    Flush(Option<Sender<()>>),
+    Flush(Option<Sender<bool>>),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -462,11 +467,13 @@ struct EventWorker {
     client: Option<Client>,
     buffer: Vec<PayloadEvent>,
     delivery_stopped: bool,
+    shared_delivery_stopped: Arc<AtomicBool>,
+    unreported_delivery_failure: bool,
     last_flush: Instant,
 }
 
 impl EventWorker {
-    fn new(config: EventWorkerConfig) -> Self {
+    fn new(config: EventWorkerConfig, shared_delivery_stopped: Arc<AtomicBool>) -> Self {
         let client = Client::builder()
             .connect_timeout(config.request_timeout.min(Duration::from_secs(1)))
             .timeout(config.request_timeout)
@@ -481,6 +488,8 @@ impl EventWorker {
             client,
             buffer: Vec::new(),
             delivery_stopped: false,
+            shared_delivery_stopped,
+            unreported_delivery_failure: false,
             last_flush: Instant::now(),
         }
     }
@@ -541,7 +550,9 @@ impl EventWorker {
                     break 'worker;
                 },
                 default(wait) => {
-                    if !self.flush(runtime, &mut abort) {
+                    let outcome = self.flush(runtime, &mut abort);
+                    self.remember_delivery_failure(outcome);
+                    if !outcome.keep_running {
                         break 'worker;
                     }
                 },
@@ -561,50 +572,69 @@ impl EventWorker {
                 if !self.delivery_stopped {
                     self.buffer.push(event);
                     if self.buffer.len() >= self.config.max_events_per_request {
-                        return self.flush(runtime, abort);
+                        let outcome = self.flush(runtime, abort);
+                        self.remember_delivery_failure(outcome);
+                        return outcome.keep_running;
                     }
                 }
                 true
             }
             EventMessage::Flush(reply) => {
-                let completed = self.flush(runtime, abort);
-                if completed {
-                    if let Some(reply) = reply {
-                        let _ignored = reply.send(());
-                    }
+                let outcome = self.flush(runtime, abort);
+                let delivered = outcome.delivered && !self.unreported_delivery_failure;
+                self.unreported_delivery_failure = false;
+                if let Some(reply) = reply {
+                    let _ignored = reply.send(delivered);
                 }
-                completed
+                outcome.keep_running
             }
         }
     }
 
-    fn flush(&mut self, runtime: &Runtime, abort: &mut watch::Receiver<bool>) -> bool {
+    fn remember_delivery_failure(&mut self, outcome: FlushOutcome) {
+        if !outcome.delivered {
+            self.unreported_delivery_failure = true;
+        }
+    }
+
+    fn flush(&mut self, runtime: &Runtime, abort: &mut watch::Receiver<bool>) -> FlushOutcome {
         self.last_flush = Instant::now();
-        if self.buffer.is_empty() || self.delivery_stopped {
+        if self.delivery_stopped {
             self.buffer.clear();
-            return true;
+            return FlushOutcome::failed();
+        }
+        if self.buffer.is_empty() {
+            return FlushOutcome::delivered();
         }
 
         let events = std::mem::take(&mut self.buffer);
         log::debug!("flushing {} FeatBit events", events.len());
+        let mut delivered = true;
         for chunk in events.chunks(self.config.max_events_per_request) {
             let payload = match serde_json::to_vec(chunk) {
                 Ok(payload) => payload,
                 Err(error) => {
                     log::warn!("failed to serialize FeatBit events: {error}");
+                    delivered = false;
                     continue;
                 }
             };
             match runtime.block_on(self.send(&payload, abort)) {
                 Delivery::Fatal => {
                     self.delivery_stopped = true;
+                    self.shared_delivery_stopped.store(true, Ordering::Release);
+                    delivered = false;
                     break;
                 }
-                Delivery::Cancelled => return false,
-                Delivery::Succeeded | Delivery::Failed => {}
+                Delivery::Cancelled => return FlushOutcome::cancelled(),
+                Delivery::Failed => delivered = false,
+                Delivery::Succeeded => {}
             }
         }
-        true
+        FlushOutcome {
+            delivered,
+            keep_running: true,
+        }
     }
 
     async fn send(&self, payload: &[u8], abort: &mut watch::Receiver<bool>) -> Delivery {
@@ -662,6 +692,35 @@ impl EventWorker {
 
         log::warn!("FeatBit event delivery exhausted its configured retry attempts");
         Delivery::Failed
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FlushOutcome {
+    delivered: bool,
+    keep_running: bool,
+}
+
+impl FlushOutcome {
+    const fn delivered() -> Self {
+        Self {
+            delivered: true,
+            keep_running: true,
+        }
+    }
+
+    const fn failed() -> Self {
+        Self {
+            delivered: false,
+            keep_running: true,
+        }
+    }
+
+    const fn cancelled() -> Self {
+        Self {
+            delivered: false,
+            keep_running: false,
+        }
     }
 }
 
@@ -798,6 +857,7 @@ mod tests {
         assert!(processor.record_metric(&test_user(), "purchase", 42.0));
         assert!(processor.flush_and_wait(Duration::from_secs(2)));
         processor.close();
+        assert!(!processor.flush_and_wait(Duration::from_secs(2)));
         request.assert();
     }
 
@@ -973,13 +1033,30 @@ mod tests {
             .expect("fatal options should build");
         let fatal_processor = EventProcessor::new(&fatal_options);
         assert!(fatal_processor.record_metric(&test_user(), "fatal", 1.0));
-        assert!(fatal_processor.flush_and_wait(Duration::from_secs(2)));
-        assert!(fatal_processor.record_metric(&test_user(), "discarded", 2.0));
-        assert!(fatal_processor.flush_and_wait(Duration::from_secs(2)));
+        assert!(!fatal_processor.flush_and_wait(Duration::from_secs(2)));
+        assert!(!fatal_processor.record_metric(&test_user(), "discarded", 2.0));
+        assert!(!fatal_processor.flush_and_wait(Duration::from_secs(2)));
         fatal_processor.close();
         fatal_server.join().expect("fatal server should stop");
         assert!(fatal_bodies.recv_timeout(Duration::from_secs(1)).is_ok());
         assert!(fatal_bodies.try_recv().is_err());
+
+        let (failed_url, failed_bodies, failed_server) = scripted_http_server([500, 500]);
+        let failed_options = crate::options::FbOptionsBuilder::new("valid-secret")
+            .event_url(failed_url)
+            .auto_flush_interval(Duration::from_mins(1))
+            .max_events_per_request(1)
+            .max_send_event_attempts(2)
+            .send_event_retry_interval(Duration::from_millis(1))
+            .build()
+            .expect("retry options should build");
+        let failed_processor = EventProcessor::new(&failed_options);
+        assert!(failed_processor.record_metric(&test_user(), "failed", 1.0));
+        assert!(!failed_processor.flush_and_wait(Duration::from_secs(2)));
+        failed_processor.close();
+        failed_server.join().expect("failed server should stop");
+        assert!(failed_bodies.recv_timeout(Duration::from_secs(1)).is_ok());
+        assert!(failed_bodies.recv_timeout(Duration::from_secs(1)).is_ok());
 
         assert!(is_recoverable(StatusCode::BAD_REQUEST));
         assert!(is_recoverable(StatusCode::REQUEST_TIMEOUT));

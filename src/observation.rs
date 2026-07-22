@@ -54,6 +54,8 @@ pub enum EvaluationObservationError {
     FlagNotFound,
     /// Remote flag data could not be evaluated safely.
     ParseError,
+    /// The selected variation could not be converted to the requested type.
+    TypeMismatch,
 }
 
 impl EvaluationObservationError {
@@ -65,6 +67,7 @@ impl EvaluationObservationError {
             Self::TargetingKeyMissing => "targeting_key_missing",
             Self::FlagNotFound => "flag_not_found",
             Self::ParseError => "parse_error",
+            Self::TypeMismatch => "type_mismatch",
         }
     }
 }

@@ -22,6 +22,13 @@ pub(crate) struct SnapshotStore {
     write_lock: Mutex<()>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PatchResult {
+    Changed,
+    Unchanged,
+    VersionConflict,
+}
+
 impl SnapshotStore {
     pub(crate) fn new() -> Self {
         Self::default()
@@ -75,21 +82,30 @@ impl SnapshotStore {
         }));
     }
 
-    pub(crate) fn patch(&self, data: &DataSet) -> bool {
+    pub(crate) fn patch(&self, data: &DataSet) -> PatchResult {
         let _write_guard = self.write_lock.lock();
         let current = self.load();
         let mut flags = current.flags.clone();
         let mut segments = current.segments.clone();
         let mut prepared = current.prepared.clone();
         let mut changed = false;
+        let mut version_conflict = false;
 
         for flag in &data.feature_flags {
             if flag.key.is_empty() {
                 continue;
             }
-            let should_replace = flags
-                .get(&flag.key)
-                .is_none_or(|existing| existing.updated_at < flag.updated_at);
+            let should_replace = match flags.get(&flag.key) {
+                None => true,
+                Some(existing) if existing.updated_at < flag.updated_at => true,
+                Some(existing)
+                    if existing.updated_at == flag.updated_at && existing.as_ref() != flag =>
+                {
+                    version_conflict = true;
+                    false
+                }
+                Some(_) => false,
+            };
             if should_replace {
                 prepared
                     .flags
@@ -102,9 +118,18 @@ impl SnapshotStore {
             if segment.id.is_empty() {
                 continue;
             }
-            let should_replace = segments
-                .get(&segment.id)
-                .is_none_or(|existing| existing.updated_at < segment.updated_at);
+            let should_replace = match segments.get(&segment.id) {
+                None => true,
+                Some(existing) if existing.updated_at < segment.updated_at => true,
+                Some(existing)
+                    if existing.updated_at == segment.updated_at
+                        && existing.as_ref() != segment =>
+                {
+                    version_conflict = true;
+                    false
+                }
+                Some(_) => false,
+            };
             if should_replace {
                 prepared
                     .segments
@@ -129,7 +154,13 @@ impl SnapshotStore {
                 populated: true,
             }));
         }
-        changed
+        if version_conflict {
+            PatchResult::VersionConflict
+        } else if changed {
+            PatchResult::Changed
+        } else {
+            PatchResult::Unchanged
+        }
     }
 }
 
@@ -161,16 +192,22 @@ mod tests {
         });
         assert_eq!(store.load().flags.len(), 2);
 
-        assert!(store.patch(&DataSet {
-            event_type: "patch".to_owned(),
-            feature_flags: vec![flag("a", 2, true)],
-            ..DataSet::default()
-        }));
-        assert!(!store.patch(&DataSet {
-            event_type: "patch".to_owned(),
-            feature_flags: vec![flag("a", 1, false)],
-            ..DataSet::default()
-        }));
+        assert_eq!(
+            store.patch(&DataSet {
+                event_type: "patch".to_owned(),
+                feature_flags: vec![flag("a", 2, true)],
+                ..DataSet::default()
+            }),
+            PatchResult::Changed
+        );
+        assert_eq!(
+            store.patch(&DataSet {
+                event_type: "patch".to_owned(),
+                feature_flags: vec![flag("a", 1, false)],
+                ..DataSet::default()
+            }),
+            PatchResult::Unchanged
+        );
         assert!(store.load().flags["a"].is_archived);
         assert_eq!(store.version(), 2);
 
@@ -205,7 +242,7 @@ mod tests {
                         ..DataSet::default()
                     };
                     barrier.wait();
-                    assert!(store.patch(&data));
+                    assert_eq!(store.patch(&data), PatchResult::Changed);
                 })
             })
             .collect::<Vec<_>>();
@@ -247,12 +284,44 @@ mod tests {
         ));
         drop(initial);
 
-        assert!(store.patch(&DataSet {
-            event_type: "patch".to_owned(),
-            feature_flags: vec![flag("other", 2, false)],
-            ..DataSet::default()
-        }));
+        assert_eq!(
+            store.patch(&DataSet {
+                event_type: "patch".to_owned(),
+                feature_flags: vec![flag("other", 2, false)],
+                ..DataSet::default()
+            }),
+            PatchResult::Changed
+        );
         let patched = store.load();
         assert!(Arc::ptr_eq(&prepared, &patched.prepared.flags["prepared"]));
+    }
+
+    #[test]
+    fn equal_version_with_different_content_reports_a_conflict() {
+        let store = SnapshotStore::new();
+        store.populate(&DataSet {
+            event_type: "full".to_owned(),
+            feature_flags: vec![flag("same-version", 7, false)],
+            ..DataSet::default()
+        });
+
+        assert_eq!(
+            store.patch(&DataSet {
+                event_type: "patch".to_owned(),
+                feature_flags: vec![flag("same-version", 7, true)],
+                ..DataSet::default()
+            }),
+            PatchResult::VersionConflict
+        );
+        assert!(!store.load().flags["same-version"].is_archived);
+
+        assert_eq!(
+            store.patch(&DataSet {
+                event_type: "patch".to_owned(),
+                feature_flags: vec![flag("same-version", 7, false)],
+                ..DataSet::default()
+            }),
+            PatchResult::Unchanged
+        );
     }
 }

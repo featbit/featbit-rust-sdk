@@ -9,6 +9,7 @@ use open_feature::{
 use crate::client::{ClientEvaluationError, ClientStatus, FbClient};
 use crate::evaluation::{EvalReason, EvalResult};
 use crate::model::FbUser;
+use crate::observation::EvaluationObservationError;
 use crate::options::FbOptions;
 
 /// `FeatBit`'s direct implementation of the official `OpenFeature` Rust provider interface.
@@ -94,14 +95,38 @@ impl FeatBitProvider {
         context: &EvaluationContext,
         convert: impl FnOnce(&str) -> Result<T, EvaluationErrorCode>,
     ) -> EvaluationResult<ResolutionDetails<T>> {
-        let user = user_from_context(context)?;
-        let (evaluated, _event) = self
+        let user = match user_from_context(context) {
+            Ok(user) => user,
+            Err(error) => {
+                self.client.observe_error(
+                    flag_key,
+                    None,
+                    EvaluationObservationError::TargetingKeyMissing,
+                );
+                return Err(error);
+            }
+        };
+        let (evaluated, event) = self
             .client
             .evaluate_raw(flag_key, &user)
             .map_err(map_client_error)?;
-        let value = convert(&evaluated.variation.value).map_err(|code| {
-            evaluation_error(code, format!("flag {flag_key:?} has an incompatible value"))
-        })?;
+        let value = match convert(&evaluated.variation.value) {
+            Ok(value) => value,
+            Err(code) => {
+                let observation_error = if code == EvaluationErrorCode::TypeMismatch {
+                    EvaluationObservationError::TypeMismatch
+                } else {
+                    EvaluationObservationError::ParseError
+                };
+                self.client
+                    .observe_error(flag_key, Some(user.key()), observation_error);
+                return Err(evaluation_error(
+                    code,
+                    format!("flag {flag_key:?} has an incompatible value"),
+                ));
+            }
+        };
+        self.client.complete_evaluation(&user, &evaluated, &event);
         Ok(resolution_details(evaluated, value))
     }
 }
@@ -353,9 +378,12 @@ fn open_feature_value_to_json(value: &Value) -> Option<serde_json::Value> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use open_feature::provider::FeatureProvider;
 
     use super::*;
+    use crate::observation::{EvaluationObservation, EvaluationObserver};
     use crate::options::FbOptionsBuilder;
 
     const BOOTSTRAP: &str = r#"{
@@ -365,8 +393,27 @@ mod tests {
             "variations":[{"id":"on","value":"true"},{"id":"off","value":"false"}],
             "targetUsers":[],"rules":[],"isEnabled":true,"disabledVariationId":"off",
             "fallthrough":{"includedInExpt":false,"variations":[{"id":"on","rollout":[0,1],"exptRollout":0}]}
+        },{
+            "id":"invalid-flag-id","key":"invalid-bool","updatedAt":1,"variationType":"boolean",
+            "variations":[{"id":"invalid","value":"not-a-boolean"}],
+            "targetUsers":[],"rules":[],"isEnabled":true,
+            "fallthrough":{"includedInExpt":false,"variations":[{"id":"invalid","rollout":[0,1],"exptRollout":0}]}
         }],"segments":[]}
     }"#;
+
+    #[derive(Clone, Default)]
+    struct RecordingObserver {
+        observations: Arc<Mutex<Vec<EvaluationObservation>>>,
+    }
+
+    impl EvaluationObserver for RecordingObserver {
+        fn on_evaluation(&self, observation: &EvaluationObservation) {
+            self.observations
+                .lock()
+                .expect("test observer lock should remain available")
+                .push(observation.clone());
+        }
+    }
 
     fn provider() -> FeatBitProvider {
         let options = FbOptionsBuilder::new("valid-secret")
@@ -437,6 +484,47 @@ mod tests {
             .await
             .expect_err("missing key should fail");
         assert_eq!(error.code, EvaluationErrorCode::TargetingKeyMissing);
+    }
+
+    #[tokio::test]
+    async fn observer_records_open_feature_context_and_conversion_errors() {
+        let observer = RecordingObserver::default();
+        let observations = Arc::clone(&observer.observations);
+        let options = FbOptionsBuilder::new("valid-secret")
+            .offline(true)
+            .evaluation_observer(observer)
+            .bootstrap_json(BOOTSTRAP)
+            .build()
+            .expect("offline options should build");
+        let provider = FeatBitProvider::new(options);
+
+        let missing = provider
+            .resolve_bool_value("enabled", &EvaluationContext::default())
+            .await
+            .expect_err("missing targeting key should fail");
+        assert_eq!(missing.code, EvaluationErrorCode::TargetingKeyMissing);
+
+        let context = EvaluationContext::default().with_targeting_key("user-1");
+        let mismatch = provider
+            .resolve_bool_value("invalid-bool", &context)
+            .await
+            .expect_err("invalid boolean should fail conversion");
+        assert_eq!(mismatch.code, EvaluationErrorCode::TypeMismatch);
+
+        let observations = observations
+            .lock()
+            .expect("test observer lock should remain available");
+        assert_eq!(observations.len(), 2);
+        assert_eq!(
+            observations[0].error_type(),
+            Some(EvaluationObservationError::TargetingKeyMissing)
+        );
+        assert_eq!(observations[0].context_key(), None);
+        assert_eq!(
+            observations[1].error_type(),
+            Some(EvaluationObservationError::TypeMismatch)
+        );
+        assert_eq!(observations[1].context_key(), Some("user-1"));
     }
 
     #[test]

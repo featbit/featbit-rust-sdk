@@ -17,7 +17,7 @@ use url::Url;
 
 use crate::model::DataSyncEnvelope;
 use crate::options::FbOptions;
-use crate::store::SnapshotStore;
+use crate::store::{PatchResult, SnapshotStore};
 use crate::user_agent;
 use crate::worker::{WorkerThread, WorkerWait};
 
@@ -184,6 +184,7 @@ async fn run_sync_loop(
 ) {
     log::info!("starting FeatBit WebSocket data synchronizer");
     let mut retry_attempt = 0_usize;
+    let mut force_full_sync = false;
 
     loop {
         if *stop.borrow() {
@@ -203,14 +204,22 @@ async fn run_sync_loop(
             Ok(mut socket) => {
                 let connected_at = Instant::now();
                 log::debug!("FeatBit WebSocket connected");
-                match send_data_sync(&mut socket, store.version(), &options, &mut stop).await {
+                let requested_version = if force_full_sync { 0 } else { store.version() };
+                match send_data_sync(&mut socket, requested_version, &options, &mut stop).await {
                     SocketSend::Stopped => break,
                     SocketSend::Failed(error) => {
                         log::debug!("failed to send FeatBit data-sync request: {error}");
                     }
                     SocketSend::Sent => {
-                        let end =
-                            run_connection(&mut socket, &options, &store, &status, &mut stop).await;
+                        let end = run_connection(
+                            &mut socket,
+                            &options,
+                            &store,
+                            &status,
+                            &mut stop,
+                            force_full_sync,
+                        )
+                        .await;
                         // A completed handshake is not a healthy session: an accept-and-drop peer
                         // must advance the backoff instead of creating a zero-delay reconnect loop.
                         // Reset only after valid data arrived and the connection survived long
@@ -229,7 +238,8 @@ async fn run_sync_loop(
                                 status.set(SyncStatus::Closed);
                                 return;
                             }
-                            ConnectionEnd::Reconnect => {}
+                            ConnectionEnd::Reconnect => force_full_sync = false,
+                            ConnectionEnd::Resync => force_full_sync = true,
                         }
                     }
                 }
@@ -304,6 +314,7 @@ async fn run_connection(
     store: &SnapshotStore,
     status: &StatusTracker,
     stop: &mut watch::Receiver<bool>,
+    mut awaiting_full_sync: bool,
 ) -> ConnectionEnd {
     let first_ping = Instant::now() + options.keep_alive_interval;
     let mut ping = time::interval_at(first_ping, options.keep_alive_interval);
@@ -330,7 +341,7 @@ async fn run_connection(
                     SocketSend::Stopped => return ConnectionEnd::Stopped,
                     SocketSend::Failed(error) => {
                         log::debug!("failed to send FeatBit WebSocket ping: {error}");
-                        return ConnectionEnd::Reconnect;
+                        return reconnect_end(awaiting_full_sync);
                     }
                 }
             }
@@ -339,16 +350,34 @@ async fn run_connection(
                     Some(Ok(Message::Text(text))) => {
                         if text.len() > options.max_ws_message_size {
                             log::warn!("discarding oversized FeatBit WebSocket message");
-                            return ConnectionEnd::Reconnect;
+                            return reconnect_end(awaiting_full_sync);
                         }
-                        apply_message(store, status, text.as_bytes());
+                        if let Some(end) = handle_apply_result(
+                            apply_message(store, status, text.as_bytes()),
+                            socket,
+                            options,
+                            status,
+                            stop,
+                            &mut awaiting_full_sync,
+                        ).await {
+                            return end;
+                        }
                     }
                     Some(Ok(Message::Binary(bytes))) => {
                         if bytes.len() > options.max_ws_message_size {
                             log::warn!("discarding oversized FeatBit WebSocket message");
-                            return ConnectionEnd::Reconnect;
+                            return reconnect_end(awaiting_full_sync);
                         }
-                        apply_message(store, status, &bytes);
+                        if let Some(end) = handle_apply_result(
+                            apply_message(store, status, &bytes),
+                            socket,
+                            options,
+                            status,
+                            stop,
+                            &mut awaiting_full_sync,
+                        ).await {
+                            return end;
+                        }
                     }
                     Some(Ok(Message::Ping(payload))) => {
                         match send_socket_message(
@@ -359,7 +388,7 @@ async fn run_connection(
                         ).await {
                             SocketSend::Sent => {}
                             SocketSend::Stopped => return ConnectionEnd::Stopped,
-                            SocketSend::Failed(_) => return ConnectionEnd::Reconnect,
+                            SocketSend::Failed(_) => return reconnect_end(awaiting_full_sync),
                         }
                     }
                     Some(Ok(Message::Pong(_) | Message::Frame(_))) => {}
@@ -368,41 +397,57 @@ async fn run_connection(
                         return if code == 4003 {
                             ConnectionEnd::Terminal(code)
                         } else {
-                            ConnectionEnd::Reconnect
+                            reconnect_end(awaiting_full_sync)
                         };
                     }
                     Some(Err(error)) => {
                         log::debug!("FeatBit WebSocket receive failed: {error}");
-                        return ConnectionEnd::Reconnect;
+                        return reconnect_end(awaiting_full_sync);
                     }
-                    None => return ConnectionEnd::Reconnect,
+                    None => return reconnect_end(awaiting_full_sync),
                 }
             }
         }
     }
 }
 
-fn apply_message(store: &SnapshotStore, status: &StatusTracker, payload: &[u8]) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ApplyResult {
+    Full,
+    Patch,
+    Ignored,
+    VersionConflict,
+}
+
+fn apply_message(store: &SnapshotStore, status: &StatusTracker, payload: &[u8]) -> ApplyResult {
     let envelope = match serde_json::from_slice::<DataSyncEnvelope>(payload) {
         Ok(envelope) => envelope,
         Err(error) => {
             log::debug!("discarding malformed FeatBit WebSocket message: {error}");
-            return;
+            return ApplyResult::Ignored;
         }
     };
     if envelope.message_type != "data-sync" {
-        return;
+        return ApplyResult::Ignored;
     }
 
-    match envelope.data.event_type.as_str() {
-        "full" => store.populate(&envelope.data),
-        "patch" => {
-            store.patch(&envelope.data);
+    let result = match envelope.data.event_type.as_str() {
+        "full" => {
+            store.populate(&envelope.data);
+            ApplyResult::Full
         }
+        "patch" => match store.patch(&envelope.data) {
+            PatchResult::Changed | PatchResult::Unchanged => ApplyResult::Patch,
+            PatchResult::VersionConflict => ApplyResult::VersionConflict,
+        },
         event_type => {
             log::debug!("ignoring unknown FeatBit data-sync event type {event_type:?}");
-            return;
+            return ApplyResult::Ignored;
         }
+    };
+    if result == ApplyResult::VersionConflict {
+        status.set(SyncStatus::Stale);
+        return result;
     }
     log::debug!(
         "applied FeatBit {} data-sync at version {}",
@@ -410,6 +455,53 @@ fn apply_message(store: &SnapshotStore, status: &StatusTracker, payload: &[u8]) 
         store.version()
     );
     status.set(SyncStatus::Ready);
+    result
+}
+
+async fn handle_apply_result(
+    result: ApplyResult,
+    socket: &mut Socket,
+    options: &FbOptions,
+    status: &StatusTracker,
+    stop: &mut watch::Receiver<bool>,
+    awaiting_full_sync: &mut bool,
+) -> Option<ConnectionEnd> {
+    // A patch cannot prove that the equal-version collision was resolved. Keep serving the
+    // immutable last-known snapshot as stale until the requested authoritative full arrives.
+    if *awaiting_full_sync && result != ApplyResult::Full {
+        status.set(SyncStatus::Stale);
+    }
+    match result {
+        ApplyResult::Full => {
+            *awaiting_full_sync = false;
+            None
+        }
+        ApplyResult::VersionConflict if !*awaiting_full_sync => {
+            log::warn!(
+                "detected conflicting FeatBit patch objects with the same version; requesting a full data sync"
+            );
+            match send_data_sync(socket, 0, options, stop).await {
+                SocketSend::Sent => {
+                    *awaiting_full_sync = true;
+                    None
+                }
+                SocketSend::Stopped => Some(ConnectionEnd::Stopped),
+                SocketSend::Failed(error) => {
+                    log::debug!("failed to request a full FeatBit data sync: {error}");
+                    Some(ConnectionEnd::Resync)
+                }
+            }
+        }
+        ApplyResult::Patch | ApplyResult::Ignored | ApplyResult::VersionConflict => None,
+    }
+}
+
+const fn reconnect_end(awaiting_full_sync: bool) -> ConnectionEnd {
+    if awaiting_full_sync {
+        ConnectionEnd::Resync
+    } else {
+        ConnectionEnd::Reconnect
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -456,6 +548,7 @@ enum ConnectionEnd {
     Stopped,
     Terminal(u16),
     Reconnect,
+    Resync,
 }
 
 fn streaming_url(options: &FbOptions) -> Result<Url, String> {
@@ -576,17 +669,26 @@ mod tests {
         let store = SnapshotStore::new();
         let status = StatusTracker::new(SyncStatus::Starting, false);
         let full = br#"{"messageType":"data-sync","data":{"eventType":"full","featureFlags":[{"key":"flag","updatedAt":1,"variations":[]}],"segments":[]}}"#;
-        apply_message(&store, &status, full);
+        assert_eq!(apply_message(&store, &status, full), ApplyResult::Full);
         assert!(status.initialized());
         assert_eq!(store.version(), 1);
 
         let patch = br#"{"messageType":"data-sync","data":{"eventType":"patch","featureFlags":[{"key":"flag","updatedAt":2,"isArchived":true}],"segments":[]}}"#;
-        apply_message(&store, &status, patch);
+        assert_eq!(apply_message(&store, &status, patch), ApplyResult::Patch);
         assert_eq!(store.version(), 2);
         assert!(store.load().flags["flag"].is_archived);
 
+        let conflict = br#"{"messageType":"data-sync","data":{"eventType":"patch","featureFlags":[{"key":"flag","updatedAt":2,"isArchived":false}],"segments":[]}}"#;
+        assert_eq!(
+            apply_message(&store, &status, conflict),
+            ApplyResult::VersionConflict
+        );
+        assert_eq!(status.status(), SyncStatus::Stale);
+        assert!(store.load().flags["flag"].is_archived);
+
         let stale = br#"{"messageType":"data-sync","data":{"eventType":"patch","featureFlags":[{"key":"flag","updatedAt":1,"isArchived":false}],"segments":[]}}"#;
-        apply_message(&store, &status, stale);
+        assert_eq!(apply_message(&store, &status, stale), ApplyResult::Patch);
+        assert_eq!(status.status(), SyncStatus::Ready);
         assert!(store.load().flags["flag"].is_archived);
     }
 
@@ -685,6 +787,100 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(patched, "patch should become visible to evaluation");
+
+        tokio::task::spawn_blocking(move || client.close())
+            .await
+            .expect("client close task should finish");
+        server.await.expect("test server should stop");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn equal_version_conflict_requests_an_authoritative_full_snapshot() {
+        const INITIAL: &str = r#"{"messageType":"data-sync","data":{"eventType":"full","featureFlags":[{"id":"flag-id","key":"collision-flag","updatedAt":5,"variationType":"boolean","variations":[{"id":"value","value":"true"}],"targetUsers":[],"rules":[],"isEnabled":true,"fallthrough":{"variations":[{"id":"value","rollout":[0,1],"exptRollout":0}]}}],"segments":[]}}"#;
+        const FIRST_PATCH: &str = r#"{"messageType":"data-sync","data":{"eventType":"patch","featureFlags":[{"id":"flag-id","key":"collision-flag","updatedAt":6,"variationType":"boolean","variations":[{"id":"value","value":"false"}],"targetUsers":[],"rules":[],"isEnabled":true,"fallthrough":{"variations":[{"id":"value","rollout":[0,1],"exptRollout":0}]}}],"segments":[]}}"#;
+        const CONFLICTING_PATCH: &str = r#"{"messageType":"data-sync","data":{"eventType":"patch","featureFlags":[{"id":"flag-id","key":"collision-flag","updatedAt":6,"variationType":"boolean","variations":[{"id":"value","value":"true"}],"targetUsers":[],"rules":[],"isEnabled":true,"fallthrough":{"variations":[{"id":"value","rollout":[0,1],"exptRollout":0}]}}],"segments":[]}}"#;
+        const AUTHORITATIVE_FULL: &str = r#"{"messageType":"data-sync","data":{"eventType":"full","featureFlags":[{"id":"flag-id","key":"collision-flag","updatedAt":6,"variationType":"boolean","variations":[{"id":"value","value":"true"}],"targetUsers":[],"rules":[],"isEnabled":true,"fallthrough":{"variations":[{"id":"value","rollout":[0,1],"exptRollout":0}]}}],"segments":[]}}"#;
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("test listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should have an address");
+        let (first_patch_sender, first_patch_receiver) = oneshot::channel::<()>();
+        let (conflict_sender, conflict_receiver) = oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let mut socket = accept_test_socket(&listener).await;
+            assert!(next_test_text(&mut socket)
+                .await
+                .contains("\"timestamp\":0"));
+            socket
+                .send(Message::Text(INITIAL.into()))
+                .await
+                .expect("initial full data should send");
+
+            first_patch_receiver
+                .await
+                .expect("first patch should be requested");
+            socket
+                .send(Message::Text(FIRST_PATCH.into()))
+                .await
+                .expect("first patch should send");
+
+            conflict_receiver
+                .await
+                .expect("conflicting patch should be requested");
+            socket
+                .send(Message::Text(CONFLICTING_PATCH.into()))
+                .await
+                .expect("conflicting patch should send");
+            let resync = time::timeout(Duration::from_secs(2), next_test_text(&mut socket))
+                .await
+                .expect("version conflict should request another data sync");
+            assert!(resync.contains("\"timestamp\":0"));
+            socket
+                .send(Message::Text(AUTHORITATIVE_FULL.into()))
+                .await
+                .expect("authoritative full data should send");
+            serve_until_client_close(&mut socket).await;
+        });
+
+        let options = FbOptionsBuilder::new("valid-environment-secret")
+            .streaming_url(format!("ws://{address}"))
+            .disable_events(true, false)
+            .start_wait(Duration::from_secs(2))
+            .connect_timeout(Duration::from_secs(1))
+            .close_timeout(Duration::from_secs(1))
+            .keep_alive_interval(Duration::from_mins(1))
+            .build()
+            .expect("options should build");
+        let client = tokio::task::spawn_blocking(move || FbClient::with_options(options))
+            .await
+            .expect("client construction task should finish");
+        let user = FbUser::builder("user-1").build();
+        assert!(client.bool_variation("collision-flag", &user, false));
+
+        first_patch_sender
+            .send(())
+            .expect("test server should receive first patch trigger");
+        for _ in 0..100 {
+            if !client.bool_variation("collision-flag", &user, true) {
+                break;
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!client.bool_variation("collision-flag", &user, true));
+
+        conflict_sender
+            .send(())
+            .expect("test server should receive conflict trigger");
+        for _ in 0..100 {
+            if client.bool_variation("collision-flag", &user, false) {
+                break;
+            }
+            time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(client.bool_variation("collision-flag", &user, false));
 
         tokio::task::spawn_blocking(move || client.close())
             .await

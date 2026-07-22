@@ -230,7 +230,11 @@ impl FbClient {
         user: &FbUser,
         default: i64,
     ) -> EvaluationDetail<i64> {
-        self.evaluate_typed(key, user, default, |value| value.parse().ok())
+        self.evaluate_typed(key, user, default, |value| {
+            value
+                .parse()
+                .map_err(|_| EvaluationObservationError::TypeMismatch)
+        })
     }
 
     /// Evaluates a 64-bit floating-point flag, returning `default` on every failure.
@@ -252,6 +256,7 @@ impl FbClient {
                 .parse::<f64>()
                 .ok()
                 .filter(|number| number.is_finite())
+                .ok_or(EvaluationObservationError::TypeMismatch)
         })
     }
 
@@ -269,9 +274,7 @@ impl FbClient {
         user: &FbUser,
         default: &str,
     ) -> EvaluationDetail<String> {
-        self.evaluate_typed(key, user, default.to_owned(), |value| {
-            Some(value.to_owned())
-        })
+        self.evaluate_typed(key, user, default.to_owned(), |value| Ok(value.to_owned()))
     }
 
     /// Evaluates a JSON flag, returning `default` on every failure.
@@ -293,7 +296,9 @@ impl FbClient {
         user: &FbUser,
         default: serde_json::Value,
     ) -> EvaluationDetail<serde_json::Value> {
-        self.evaluate_typed(key, user, default, |value| serde_json::from_str(value).ok())
+        self.evaluate_typed(key, user, default, |value| {
+            serde_json::from_str(value).map_err(|_| EvaluationObservationError::ParseError)
+        })
     }
 
     /// Evaluates every currently known, non-archived flag as its raw string variation.
@@ -389,7 +394,11 @@ impl FbClient {
         self.inner.event_processor.flush();
     }
 
-    /// Flushes events and waits up to `timeout` for delivery attempts to finish.
+    /// Flushes events and waits up to `timeout` for delivery.
+    ///
+    /// Returns `true` only when every event covered by this flush was delivered successfully (or
+    /// no event processor is active). A timeout, exhausted retry sequence, unrecoverable response,
+    /// stopped worker, or concurrent shutdown returns `false`.
     #[must_use]
     pub fn flush_and_wait(&self, timeout: Duration) -> bool {
         self.inner.event_processor.flush_and_wait(timeout)
@@ -407,28 +416,33 @@ impl FbClient {
         key: &str,
         user: &FbUser,
         default: T,
-        converter: impl FnOnce(&str) -> Option<T>,
+        converter: impl FnOnce(&str) -> Result<T, EvaluationObservationError>,
     ) -> EvaluationDetail<T> {
         match self.evaluate_raw(key, user) {
             Ok((result, event)) => {
                 let (kind, reason) = reason_detail(&result.reason);
                 match converter(&result.variation.value) {
-                    Some(value) => EvaluationDetail {
-                        key: key.to_owned(),
-                        kind,
-                        reason,
-                        value,
-                        variation_id: result.variation.id,
-                        evaluation_event: Some(event),
-                    },
-                    None => EvaluationDetail {
-                        key: key.to_owned(),
-                        kind: ReasonKind::WrongType,
-                        reason: "type mismatch".to_owned(),
-                        value: default,
-                        variation_id: String::new(),
-                        evaluation_event: Some(event),
-                    },
+                    Ok(value) => {
+                        self.complete_evaluation(user, &result, &event);
+                        EvaluationDetail {
+                            key: key.to_owned(),
+                            kind,
+                            reason,
+                            value,
+                            variation_id: result.variation.id,
+                            evaluation_event: Some(event),
+                        }
+                    }
+                    Err(error) => {
+                        self.observe_error(key, Some(user.key()), error);
+                        let (kind, reason) = match error {
+                            EvaluationObservationError::ParseError => {
+                                (ReasonKind::Error, "parse error")
+                            }
+                            _ => (ReasonKind::WrongType, "type mismatch"),
+                        };
+                        EvaluationDetail::fallback(key, kind, reason, default)
+                    }
                 }
             }
             Err(error) => {
@@ -479,14 +493,18 @@ impl FbClient {
             &result.variation.value,
             result.send_to_experiment,
         );
-        if !self.inner.options.disable_events {
-            let _accepted = self.inner.event_processor.record_evaluation(user, &event);
-        }
-        self.observe_success(user, &result, &event);
         Ok((result, event))
     }
 
-    fn observe_success(&self, user: &FbUser, result: &EvalResult, event: &FbEvaluationEvent) {
+    pub(crate) fn complete_evaluation(
+        &self,
+        user: &FbUser,
+        result: &EvalResult,
+        event: &FbEvaluationEvent,
+    ) {
+        if !self.inner.options.disable_events {
+            let _accepted = self.inner.event_processor.record_evaluation(user, event);
+        }
         let Some(observer) = &self.inner.options.evaluation_observer else {
             return;
         };
@@ -502,7 +520,7 @@ impl FbClient {
         observer.on_evaluation(&observation);
     }
 
-    fn observe_error(
+    pub(crate) fn observe_error(
         &self,
         key: &str,
         context_key: Option<&str>,
@@ -627,13 +645,13 @@ fn reason_detail(reason: &EvalReason) -> (ReasonKind, String) {
     }
 }
 
-fn parse_bool(value: &str) -> Option<bool> {
+fn parse_bool(value: &str) -> Result<bool, EvaluationObservationError> {
     if value.eq_ignore_ascii_case("true") {
-        Some(true)
+        Ok(true)
     } else if value.eq_ignore_ascii_case("false") {
-        Some(false)
+        Ok(false)
     } else {
-        None
+        Err(EvaluationObservationError::TypeMismatch)
     }
 }
 
@@ -669,6 +687,13 @@ mod tests {
             "targetUsers":[],"rules":[],"isEnabled":true,
             "fallthrough":{"includedInExpt":false,"variations":[
                 {"id":"value","rollout":[0,1],"exptRollout":0}
+            ]}
+        },{
+            "id":"invalid-flag-id","key":"invalid-bool","updatedAt":1,"variationType":"boolean",
+            "variations":[{"id":"invalid-value","value":"not-a-boolean"}],
+            "targetUsers":[],"rules":[],"isEnabled":true,
+            "fallthrough":{"includedInExpt":false,"variations":[
+                {"id":"invalid-value","rollout":[0,1],"exptRollout":0}
             ]}
         }],"segments":[]}
     }"#;
@@ -889,11 +914,15 @@ mod tests {
                 .expect("successful evaluation should retain an event")
         ));
         let _fallback = client.bool_variation("missing", &user, false);
+        let mismatch = client.bool_variation_detail("invalid-bool", &user, true);
+        assert!(mismatch.value);
+        assert_eq!(mismatch.kind, ReasonKind::WrongType);
+        assert!(mismatch.evaluation_event.is_none());
 
         let observations = observations
             .lock()
             .expect("test observer lock should remain available");
-        assert_eq!(observations.len(), 2);
+        assert_eq!(observations.len(), 3);
         assert_eq!(
             observations[0].reason(),
             EvaluationObservationReason::Default
@@ -902,6 +931,10 @@ mod tests {
         assert_eq!(
             observations[1].error_type(),
             Some(EvaluationObservationError::FlagNotFound)
+        );
+        assert_eq!(
+            observations[2].error_type(),
+            Some(EvaluationObservationError::TypeMismatch)
         );
         assert!(!format!("{:?}", observations[0]).contains("private-user-key"));
         client.close();

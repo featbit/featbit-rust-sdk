@@ -107,7 +107,7 @@ pub(crate) struct DataSet {
     pub(crate) segments: Vec<Segment>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct FeatureFlag {
     #[serde(default)]
@@ -151,7 +151,7 @@ pub(crate) struct Variation {
     pub(crate) value: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TargetUser {
     #[serde(default)]
@@ -160,7 +160,7 @@ pub(crate) struct TargetUser {
     pub(crate) variation_id: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TargetRule {
     #[serde(default)]
@@ -175,7 +175,7 @@ pub(crate) struct TargetRule {
     pub(crate) variations: Vec<RolloutVariation>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Fallthrough {
     #[serde(default)]
@@ -186,7 +186,7 @@ pub(crate) struct Fallthrough {
     pub(crate) variations: Vec<RolloutVariation>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct RolloutVariation {
     #[serde(default)]
@@ -197,7 +197,7 @@ pub(crate) struct RolloutVariation {
     pub(crate) expt_rollout: f64,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Condition {
     #[serde(default)]
@@ -208,7 +208,7 @@ pub(crate) struct Condition {
     pub(crate) value: String,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Segment {
     #[serde(default)]
@@ -225,7 +225,7 @@ pub(crate) struct Segment {
     pub(crate) is_archived: bool,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MatchRule {
     #[serde(default)]
