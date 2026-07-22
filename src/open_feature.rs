@@ -14,8 +14,8 @@ use crate::options::FbOptions;
 /// `FeatBit`'s direct implementation of the official `OpenFeature` Rust provider interface.
 ///
 /// The provider owns a cloneable [`FbClient`] handle. Register it with
-/// `OpenFeature::set_provider`; use [`Self::client`] for FeatBit-specific tracking, flush, and
-/// explicit shutdown operations.
+/// `OpenFeature::set_provider`; use the provider tracking extensions with an
+/// [`EvaluationContext`], and [`Self::client`] for flush, status, and explicit shutdown operations.
 #[derive(Clone, Debug)]
 pub struct FeatBitProvider {
     client: FbClient,
@@ -44,6 +44,50 @@ impl FeatBitProvider {
         &self.client
     }
 
+    /// Re-evaluates `flag_key` for an `OpenFeature` context and records the evaluation event.
+    ///
+    /// `OpenFeature` 0.3 does not define a tracking API, so this provider-specific extension lets
+    /// applications keep flag resolution and event attribution on the same
+    /// [`EvaluationContext`]. It returns `Ok(false)` when `FeatBit` event delivery is unavailable or
+    /// the bounded queue is full. Call it promptly after the corresponding `OpenFeature` resolution;
+    /// an intervening flag update can change the variation selected by the re-evaluation.
+    ///
+    /// # Errors
+    ///
+    /// Returns the standard `OpenFeature` targeting-key error when `evaluation_context` has no
+    /// non-empty targeting key.
+    pub fn track_eval_event_for_flag(
+        &self,
+        evaluation_context: &EvaluationContext,
+        flag_key: &str,
+    ) -> EvaluationResult<bool> {
+        let user = user_from_context(evaluation_context)?;
+        Ok(self.client.track_eval_event_for_flag(&user, flag_key))
+    }
+
+    /// Records a `FeatBit` custom metric for an `OpenFeature` context without blocking on network
+    /// I/O.
+    ///
+    /// `OpenFeature` 0.3 does not standardize custom metric events. This provider-specific extension
+    /// uses the same context mapping as flag resolution and returns `Ok(false)` when `FeatBit` event
+    /// delivery is unavailable, the event is invalid, or the bounded queue is full.
+    ///
+    /// # Errors
+    ///
+    /// Returns the standard `OpenFeature` targeting-key error when `evaluation_context` has no
+    /// non-empty targeting key.
+    pub fn track_metric_event(
+        &self,
+        evaluation_context: &EvaluationContext,
+        event_name: &str,
+        numeric_value: f64,
+    ) -> EvaluationResult<bool> {
+        let user = user_from_context(evaluation_context)?;
+        Ok(self
+            .client
+            .track_metric_event(&user, event_name, numeric_value))
+    }
+
     fn resolve<T>(
         &self,
         flag_key: &str,
@@ -51,7 +95,7 @@ impl FeatBitProvider {
         convert: impl FnOnce(&str) -> Result<T, EvaluationErrorCode>,
     ) -> EvaluationResult<ResolutionDetails<T>> {
         let user = user_from_context(context)?;
-        let evaluated = self
+        let (evaluated, _event) = self
             .client
             .evaluate_raw(flag_key, &user)
             .map_err(map_client_error)?;
@@ -393,6 +437,35 @@ mod tests {
             .await
             .expect_err("missing key should fail");
         assert_eq!(error.code, EvaluationErrorCode::TargetingKeyMissing);
+    }
+
+    #[test]
+    fn provider_tracking_extensions_use_open_feature_context_validation() {
+        let provider = provider();
+        let missing_context = EvaluationContext::default();
+        let evaluation_error = provider
+            .track_eval_event_for_flag(&missing_context, "enabled")
+            .expect_err("manual evaluation tracking requires a targeting key");
+        assert_eq!(
+            evaluation_error.code,
+            EvaluationErrorCode::TargetingKeyMissing
+        );
+        let metric_error = provider
+            .track_metric_event(&missing_context, "checkout-completed", 1.0)
+            .expect_err("metric tracking requires a targeting key");
+        assert_eq!(metric_error.code, EvaluationErrorCode::TargetingKeyMissing);
+
+        let context = EvaluationContext::default().with_targeting_key("user-1");
+        assert_eq!(
+            provider.track_eval_event_for_flag(&context, "enabled"),
+            Ok(false),
+            "offline mode does not start FeatBit event delivery"
+        );
+        assert_eq!(
+            provider.track_metric_event(&context, "checkout-completed", 1.0),
+            Ok(false),
+            "offline mode does not start FeatBit event delivery"
+        );
     }
 
     #[tokio::test]

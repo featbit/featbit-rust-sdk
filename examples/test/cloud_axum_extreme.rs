@@ -579,7 +579,7 @@ async fn run_application(
     let options = FbOptions::builder(config.environment_secret.clone())
         .streaming_url(config.streaming_url.clone())
         .event_url(config.event_url.clone())
-        .disable_events(config.disable_events)
+        .disable_events(config.disable_events, !config.disable_events)
         .start_wait(Duration::from_secs(10))
         .build()?;
     let provider = tokio::task::spawn_blocking(move || FeatBitProvider::new(options)).await?;

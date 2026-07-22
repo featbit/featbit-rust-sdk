@@ -12,6 +12,11 @@ readme = "README.md"
 keywords = ["featbit", "feature-flags", "openfeature", "server-sdk"]
 categories = ["api-bindings", "web-programming"]
 
+[workspace]
+members = [".", "integrations/opentelemetry"]
+default-members = [".", "integrations/opentelemetry"]
+resolver = "2"
+
 [[example]]
 name = "cloud_axum_extreme"
 path = "examples/test/cloud_axum_extreme.rs"

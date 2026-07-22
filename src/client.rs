@@ -1,13 +1,16 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use std::{fmt, fmt::Formatter};
 
 use crate::data_sync::{StatusTracker, SyncStatus, WebSocketDataSynchronizer};
 use crate::error::ConfigError;
 use crate::evaluation::{EvalError, EvalReason, EvalResult, Evaluator};
-use crate::events::EventProcessor;
+use crate::events::{EventProcessor, FbEvaluationEvent};
 use crate::model::FbUser;
+use crate::observation::{
+    EvaluationObservation, EvaluationObservationError, EvaluationObservationReason,
+};
 use crate::options::{FbOptions, FbOptionsBuilder};
 use crate::store::SnapshotStore;
 
@@ -46,7 +49,10 @@ pub enum ReasonKind {
 }
 
 /// A value plus `FeatBit` evaluation diagnostics.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// Equality compares the resolved value and diagnostics but intentionally ignores the captured
+/// event, whose timestamp differs for otherwise identical evaluations.
+#[derive(Clone, Debug)]
 pub struct EvaluationDetail<T> {
     /// The evaluated flag key.
     pub key: String,
@@ -58,6 +64,21 @@ pub struct EvaluationDetail<T> {
     pub value: T,
     /// The selected variation ID, or an empty string when a fallback was used.
     pub variation_id: String,
+    /// An immutable event that can be recorded later with [`FbClient::track_eval_event`].
+    ///
+    /// This is `None` when evaluation returned a fallback or when the detail came from the
+    /// inspection-only [`FbClient::all_variations`] API.
+    pub evaluation_event: Option<FbEvaluationEvent>,
+}
+
+impl<T: PartialEq> PartialEq for EvaluationDetail<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+            && self.kind == other.kind
+            && self.reason == other.reason
+            && self.value == other.value
+            && self.variation_id == other.variation_id
+    }
 }
 
 impl<T> EvaluationDetail<T> {
@@ -68,6 +89,7 @@ impl<T> EvaluationDetail<T> {
             reason: reason.into(),
             value,
             variation_id: String::new(),
+            evaluation_event: None,
         }
     }
 }
@@ -301,16 +323,65 @@ impl FbClient {
 
     /// Records a custom metric with numeric value `1.0`.
     pub fn track(&self, user: &FbUser, event_name: &str) {
-        self.track_value(user, event_name, 1.0);
+        let _accepted = self.track_metric_event(user, event_name, 1.0);
     }
 
     /// Records a custom metric without blocking on network I/O.
     pub fn track_value(&self, user: &FbUser, event_name: &str, numeric_value: f64) {
-        if self.evaluation_available() {
-            self.inner
-                .event_processor
-                .record_metric(user, event_name, numeric_value);
+        let _accepted = self.track_metric_event(user, event_name, numeric_value);
+    }
+
+    /// Records a previously captured evaluation event without blocking on network I/O.
+    ///
+    /// This is available when the `allow_track` argument to
+    /// [`FbOptionsBuilder::disable_events`] is `true`. It returns `false` when explicit tracking is
+    /// not allowed, the client is not operational, the event is invalid, or the bounded queue is
+    /// full. Use the event carried by a detail variation result to preserve the exact variation and
+    /// experiment decision selected at evaluation time. Calling this while automatic evaluation
+    /// events are enabled records a second event for the same evaluation.
+    #[must_use]
+    pub fn track_eval_event(&self, user: &FbUser, event: &FbEvaluationEvent) -> bool {
+        self.tracking_available() && self.inner.event_processor.record_evaluation(user, event)
+    }
+
+    /// Re-evaluates `flag_key` against the current snapshot and records that evaluation event.
+    ///
+    /// This convenience is useful after an `OpenFeature` resolution, whose standard detail type
+    /// cannot carry [`FbEvaluationEvent`]. Call it promptly after the original resolution. If an
+    /// intervening flag update must not change the reported variation, use a direct detail method
+    /// and pass its captured event to [`Self::track_eval_event`] instead. Calling this while
+    /// automatic evaluation events are enabled records an additional event.
+    #[must_use]
+    pub fn track_eval_event_for_flag(&self, user: &FbUser, flag_key: &str) -> bool {
+        if !self.tracking_available() {
+            return false;
         }
+        let snapshot = self.inner.store.load();
+        let Ok(result) = Evaluator::evaluate(&snapshot, flag_key, user) else {
+            return false;
+        };
+        let event = FbEvaluationEvent::new(
+            flag_key,
+            result.variation.id,
+            result.variation.value,
+            result.send_to_experiment,
+        );
+        self.inner.event_processor.record_evaluation(user, &event)
+    }
+
+    /// Records a custom metric event without blocking on network I/O.
+    ///
+    /// This is available when the `allow_track` argument to
+    /// [`FbOptionsBuilder::disable_events`] is `true`. It returns `false` when explicit tracking is
+    /// not allowed, the client is not operational, the event is invalid, or the bounded queue is
+    /// full.
+    #[must_use]
+    pub fn track_metric_event(&self, user: &FbUser, event_name: &str, numeric_value: f64) -> bool {
+        self.tracking_available()
+            && self
+                .inner
+                .event_processor
+                .record_metric(user, event_name, numeric_value)
     }
 
     /// Requests a non-blocking event flush.
@@ -339,7 +410,7 @@ impl FbClient {
         converter: impl FnOnce(&str) -> Option<T>,
     ) -> EvaluationDetail<T> {
         match self.evaluate_raw(key, user) {
-            Ok(result) => {
+            Ok((result, event)) => {
                 let (kind, reason) = reason_detail(&result.reason);
                 match converter(&result.variation.value) {
                     Some(value) => EvaluationDetail {
@@ -348,13 +419,16 @@ impl FbClient {
                         reason,
                         value,
                         variation_id: result.variation.id,
+                        evaluation_event: Some(event),
                     },
-                    None => EvaluationDetail::fallback(
-                        key,
-                        ReasonKind::WrongType,
-                        "type mismatch",
-                        default,
-                    ),
+                    None => EvaluationDetail {
+                        key: key.to_owned(),
+                        kind: ReasonKind::WrongType,
+                        reason: "type mismatch".to_owned(),
+                        value: default,
+                        variation_id: String::new(),
+                        evaluation_event: Some(event),
+                    },
                 }
             }
             Err(error) => {
@@ -377,20 +451,68 @@ impl FbClient {
         &self,
         key: &str,
         user: &FbUser,
-    ) -> Result<EvalResult, ClientEvaluationError> {
+    ) -> Result<(EvalResult, FbEvaluationEvent), ClientEvaluationError> {
         if !self.evaluation_available() {
+            self.observe_error(
+                key,
+                (!user.key().is_empty()).then_some(user.key()),
+                EvaluationObservationError::ProviderNotReady,
+            );
             return Err(ClientEvaluationError::NotReady);
         }
         let snapshot = self.inner.store.load();
-        let result =
-            Evaluator::evaluate(&snapshot, key, user).map_err(ClientEvaluationError::from)?;
-        self.inner.event_processor.record_evaluation(
-            user,
+        let result = match Evaluator::evaluate(&snapshot, key, user) {
+            Ok(result) => result,
+            Err(error) => {
+                let client_error = ClientEvaluationError::from(error);
+                self.observe_error(
+                    key,
+                    (!user.key().is_empty()).then_some(user.key()),
+                    observation_error(client_error),
+                );
+                return Err(client_error);
+            }
+        };
+        let event = FbEvaluationEvent::new(
             key,
-            &result.variation,
+            &result.variation.id,
+            &result.variation.value,
             result.send_to_experiment,
         );
-        Ok(result)
+        if !self.inner.options.disable_events {
+            let _accepted = self.inner.event_processor.record_evaluation(user, &event);
+        }
+        self.observe_success(user, &result, &event);
+        Ok((result, event))
+    }
+
+    fn observe_success(&self, user: &FbUser, result: &EvalResult, event: &FbEvaluationEvent) {
+        let Some(observer) = &self.inner.options.evaluation_observer else {
+            return;
+        };
+        let observation = EvaluationObservation::success(
+            event.timestamp(),
+            event.flag_key(),
+            user.key(),
+            event.variation_id(),
+            event.variation_value(),
+            observation_reason(&result.reason),
+            event.send_to_experiment(),
+        );
+        observer.on_evaluation(&observation);
+    }
+
+    fn observe_error(
+        &self,
+        key: &str,
+        context_key: Option<&str>,
+        error: EvaluationObservationError,
+    ) {
+        let Some(observer) = &self.inner.options.evaluation_observer else {
+            return;
+        };
+        let observation = EvaluationObservation::error(SystemTime::now(), key, context_key, error);
+        observer.on_evaluation(&observation);
     }
 
     fn evaluation_available(&self) -> bool {
@@ -400,6 +522,10 @@ impl FbClient {
                 self.inner.status.status(),
                 SyncStatus::Ready | SyncStatus::Stale
             )
+    }
+
+    fn tracking_available(&self) -> bool {
+        self.inner.options.allow_track && self.evaluation_available()
     }
 }
 
@@ -463,6 +589,29 @@ fn string_detail_from_result(key: &str, result: EvalResult) -> EvaluationDetail<
         reason,
         value: result.variation.value,
         variation_id: result.variation.id,
+        evaluation_event: None,
+    }
+}
+
+fn observation_reason(reason: &EvalReason) -> EvaluationObservationReason {
+    match reason {
+        EvalReason::Off => EvaluationObservationReason::Disabled,
+        EvalReason::TargetMatch | EvalReason::RuleMatch { split: false, .. } => {
+            EvaluationObservationReason::TargetingMatch
+        }
+        EvalReason::RuleMatch { split: true, .. } | EvalReason::Fallthrough { split: true } => {
+            EvaluationObservationReason::Split
+        }
+        EvalReason::Fallthrough { split: false } => EvaluationObservationReason::Default,
+    }
+}
+
+fn observation_error(error: ClientEvaluationError) -> EvaluationObservationError {
+    match error {
+        ClientEvaluationError::NotReady => EvaluationObservationError::ProviderNotReady,
+        ClientEvaluationError::InvalidContext => EvaluationObservationError::TargetingKeyMissing,
+        ClientEvaluationError::FlagNotFound => EvaluationObservationError::FlagNotFound,
+        ClientEvaluationError::MalformedFlag => EvaluationObservationError::ParseError,
     }
 }
 
@@ -490,10 +639,27 @@ fn parse_bool(value: &str) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::thread;
 
     use super::*;
     use crate::model::DataSyncEnvelope;
+    use crate::observation::EvaluationObserver;
+    use crate::test_support::scripted_http_server;
+
+    #[derive(Clone, Default)]
+    struct RecordingObserver {
+        observations: Arc<Mutex<Vec<EvaluationObservation>>>,
+    }
+
+    impl EvaluationObserver for RecordingObserver {
+        fn on_evaluation(&self, observation: &EvaluationObservation) {
+            self.observations
+                .lock()
+                .expect("test observer lock should remain available")
+                .push(observation.clone());
+        }
+    }
 
     const READY_BOOTSTRAP: &str = r#"{
         "messageType":"data-sync",
@@ -545,7 +711,7 @@ mod tests {
     fn evaluation_and_idempotent_close_are_thread_safe() {
         let options = FbOptionsBuilder::new("valid-secret")
             .offline(true)
-            .disable_events(true)
+            .disable_events(true, false)
             .bootstrap_json(READY_BOOTSTRAP)
             .build()
             .expect("offline options should build");
@@ -595,7 +761,7 @@ mod tests {
     fn terminal_sync_status_never_evaluates_a_previously_ready_snapshot() {
         let options = FbOptionsBuilder::new("valid-secret")
             .offline(true)
-            .disable_events(true)
+            .disable_events(true, false)
             .bootstrap_json(READY_BOOTSTRAP)
             .build()
             .expect("offline options should build");
@@ -612,6 +778,132 @@ mod tests {
         assert_eq!(client.status(), ClientStatus::Closed);
         assert!(client.initialized(), "initialized records prior readiness");
         assert!(client.all_variations(&user).is_empty());
+        client.close();
+    }
+
+    #[test]
+    fn event_modes_control_automatic_and_explicit_delivery() {
+        for (disable, allow_track, expected_evaluations, expected_metrics) in [
+            (false, true, 2, 1),
+            (false, false, 1, 0),
+            (true, true, 1, 1),
+            (true, false, 0, 0),
+        ] {
+            let expected_total = expected_evaluations + expected_metrics;
+            let statuses = if expected_total == 0 {
+                Vec::new()
+            } else {
+                vec![202]
+            };
+            let (event_url, bodies, server) = scripted_http_server(statuses);
+            let options = FbOptionsBuilder::new("valid-secret")
+                .streaming_url("ws://127.0.0.1:9")
+                .event_url(event_url)
+                .start_wait(Duration::from_millis(2))
+                .connect_timeout(Duration::from_millis(1))
+                .close_timeout(Duration::from_millis(200))
+                .auto_flush_interval(Duration::from_mins(1))
+                .flush_timeout(Duration::from_secs(2))
+                .disable_events(disable, allow_track)
+                .build()
+                .expect("online options should build");
+            let client = FbClient::with_options(options);
+            let data = serde_json::from_str::<DataSyncEnvelope>(READY_BOOTSTRAP)
+                .expect("bootstrap should parse")
+                .data;
+            client.inner.store.populate(&data);
+            client.inner.status.set(SyncStatus::Ready);
+
+            let user = FbUser::builder("user").build();
+            let detail = client.bool_variation_detail("enabled", &user, false);
+            let evaluation_event = detail
+                .evaluation_event
+                .as_ref()
+                .expect("successful detail should retain its evaluation event");
+            assert_eq!(
+                client.track_eval_event(&user, evaluation_event),
+                allow_track
+            );
+            assert_eq!(
+                client.track_metric_event(&user, "converted", 1.0),
+                allow_track
+            );
+            assert_eq!(
+                matches!(&client.inner.event_processor, EventProcessor::Disabled),
+                disable && !allow_track
+            );
+            assert!(client.flush_and_wait(Duration::from_secs(2)));
+            client.close();
+            server.join().expect("event server should stop");
+
+            if expected_total == 0 {
+                assert!(bodies.try_recv().is_err());
+                continue;
+            }
+            let body = bodies
+                .recv_timeout(Duration::from_secs(1))
+                .expect("configured events should be delivered");
+            let events = serde_json::from_slice::<serde_json::Value>(&body)
+                .expect("event batch should be JSON");
+            let events = events.as_array().expect("event batch should be an array");
+            assert_eq!(events.len(), expected_total);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.get("variations").is_some())
+                    .count(),
+                expected_evaluations
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event.get("metrics").is_some())
+                    .count(),
+                expected_metrics
+            );
+        }
+    }
+
+    #[test]
+    fn observer_is_independent_from_featbit_event_delivery() {
+        let observer = RecordingObserver::default();
+        let observations = Arc::clone(&observer.observations);
+        let options = FbOptionsBuilder::new("valid-secret")
+            .offline(true)
+            .disable_events(true, false)
+            .evaluation_observer(observer)
+            .bootstrap_json(READY_BOOTSTRAP)
+            .build()
+            .expect("offline options should build");
+        let client = FbClient::with_options(options);
+        let user = FbUser::builder("private-user-key").build();
+
+        let detail = client.bool_variation_detail("enabled", &user, false);
+        assert!(detail.value);
+        assert!(!client.track_metric_event(&user, "disabled", 1.0));
+        assert!(!client.track_eval_event(
+            &user,
+            detail
+                .evaluation_event
+                .as_ref()
+                .expect("successful evaluation should retain an event")
+        ));
+        let _fallback = client.bool_variation("missing", &user, false);
+
+        let observations = observations
+            .lock()
+            .expect("test observer lock should remain available");
+        assert_eq!(observations.len(), 2);
+        assert_eq!(
+            observations[0].reason(),
+            EvaluationObservationReason::Default
+        );
+        assert_eq!(observations[0].variation_id(), Some("value"));
+        assert_eq!(
+            observations[1].error_type(),
+            Some(EvaluationObservationError::FlagNotFound)
+        );
+        assert!(!format!("{:?}", observations[0]).contains("private-user-key"));
         client.close();
     }
 }

@@ -1,0 +1,25 @@
+[package]
+name = "featbit-server-sdk-opentelemetry"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95.0"
+authors = ["FeatBit"]
+description = "OpenTelemetry evaluation-event adapter for the FeatBit Rust server SDK"
+license = "Apache-2.0"
+repository = "https://github.com/featbit/featbit-rust-sdk"
+homepage = "https://www.featbit.co"
+readme = "README.md"
+keywords = ["featbit", "feature-flags", "opentelemetry", "observability"]
+categories = ["api-bindings", "development-tools::debugging"]
+
+[dependencies]
+featbit-server-sdk = { path = "../..", version = "0.1.0" }
+opentelemetry = { version = "0.32", default-features = false, features = ["logs", "trace"] }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
+
+[lints.clippy]
+all = "warn"
+pedantic = "warn"

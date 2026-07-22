@@ -1,6 +1,7 @@
+use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::ArcSwapOption;
 use chrono::Utc;
@@ -12,12 +13,92 @@ use tokio::runtime::{Builder as RuntimeBuilder, Runtime};
 use tokio::sync::watch;
 use url::Url;
 
-use crate::model::{FbUser, Variation};
+use crate::model::FbUser;
 use crate::options::FbOptions;
 use crate::user_agent;
 use crate::worker::{WorkerThread, WorkerWait};
 
 const MAX_PUBLIC_WAIT: Duration = Duration::from_hours(8_760);
+
+/// A snapshot of a successful flag evaluation that can be delivered explicitly.
+///
+/// Detail-returning variation methods produce this value in
+/// [`crate::EvaluationDetail::evaluation_event`]. It preserves the selected raw variation and
+/// experiment attribution decision even if flag data changes before the application records the
+/// exposure.
+#[derive(Clone, Eq, PartialEq)]
+pub struct FbEvaluationEvent {
+    flag_key: String,
+    variation_id: String,
+    variation_value: String,
+    timestamp: SystemTime,
+    send_to_experiment: bool,
+}
+
+impl FbEvaluationEvent {
+    /// Creates an explicit evaluation event using the current time.
+    ///
+    /// Prefer the event returned by a detail variation method when reporting a real SDK evaluation;
+    /// it carries the exact variation and experiment decision selected at evaluation time.
+    #[must_use]
+    pub fn new(
+        flag_key: impl Into<String>,
+        variation_id: impl Into<String>,
+        variation_value: impl Into<String>,
+        send_to_experiment: bool,
+    ) -> Self {
+        Self {
+            flag_key: flag_key.into(),
+            variation_id: variation_id.into(),
+            variation_value: variation_value.into(),
+            timestamp: SystemTime::now(),
+            send_to_experiment,
+        }
+    }
+
+    /// Returns the evaluated flag key.
+    #[must_use]
+    pub fn flag_key(&self) -> &str {
+        &self.flag_key
+    }
+
+    /// Returns the selected variation ID.
+    #[must_use]
+    pub fn variation_id(&self) -> &str {
+        &self.variation_id
+    }
+
+    /// Returns the raw selected variation value.
+    #[must_use]
+    pub fn variation_value(&self) -> &str {
+        &self.variation_value
+    }
+
+    /// Returns when the evaluation occurred.
+    #[must_use]
+    pub const fn timestamp(&self) -> SystemTime {
+        self.timestamp
+    }
+
+    /// Returns whether this exposure is eligible for experiment attribution.
+    #[must_use]
+    pub const fn send_to_experiment(&self) -> bool {
+        self.send_to_experiment
+    }
+}
+
+impl fmt::Debug for FbEvaluationEvent {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("FbEvaluationEvent")
+            .field("flag_key", &self.flag_key)
+            .field("variation_id", &self.variation_id)
+            .field("variation_value", &"[REDACTED]")
+            .field("timestamp", &self.timestamp)
+            .field("send_to_experiment", &self.send_to_experiment)
+            .finish()
+    }
+}
 
 #[derive(Debug)]
 pub(crate) enum EventProcessor {
@@ -27,7 +108,7 @@ pub(crate) enum EventProcessor {
 
 impl EventProcessor {
     pub(crate) fn new(options: &FbOptions) -> Self {
-        if options.offline || options.disable_events {
+        if options.offline || (options.disable_events && !options.allow_track) {
             return Self::Disabled;
         }
 
@@ -67,19 +148,15 @@ impl EventProcessor {
         }
     }
 
-    pub(crate) fn record_evaluation(
-        &self,
-        user: &FbUser,
-        flag_key: &str,
-        variation: &Variation,
-        send_to_experiment: bool,
-    ) -> bool {
-        self.record(PayloadEvent::evaluation(
-            user,
-            flag_key,
-            variation,
-            send_to_experiment,
-        ))
+    pub(crate) fn record_evaluation(&self, user: &FbUser, event: &FbEvaluationEvent) -> bool {
+        if user.key().is_empty()
+            || event.flag_key.trim().is_empty()
+            || event.variation_id.trim().is_empty()
+        {
+            log::debug!("discarding invalid FeatBit evaluation event");
+            return false;
+        }
+        self.record(PayloadEvent::evaluation(user, event))
     }
 
     pub(crate) fn record_metric(
@@ -88,7 +165,7 @@ impl EventProcessor {
         event_name: &str,
         numeric_value: f64,
     ) -> bool {
-        if event_name.trim().is_empty() || !numeric_value.is_finite() {
+        if user.key().is_empty() || event_name.trim().is_empty() || !numeric_value.is_finite() {
             log::debug!("discarding invalid FeatBit metric event");
             return false;
         }
@@ -248,22 +325,17 @@ enum PayloadEvent {
 }
 
 impl PayloadEvent {
-    fn evaluation(
-        user: &FbUser,
-        flag_key: &str,
-        variation: &Variation,
-        send_to_experiment: bool,
-    ) -> Self {
+    fn evaluation(user: &FbUser, event: &FbEvaluationEvent) -> Self {
         Self::Evaluation(EvaluationPayload {
             user: EventUser::from(user),
             variations: vec![EvaluationVariation {
-                feature_flag_key: flag_key.to_owned(),
+                feature_flag_key: event.flag_key.clone(),
                 variation: EventVariation {
-                    id: variation.id.clone(),
-                    value: variation.value.clone(),
+                    id: event.variation_id.clone(),
+                    value: event.variation_value.clone(),
                 },
-                timestamp: Utc::now().timestamp_millis(),
-                send_to_experiment,
+                timestamp: unix_millis(event.timestamp),
+                send_to_experiment: event.send_to_experiment,
             }],
         })
     }
@@ -280,6 +352,13 @@ impl PayloadEvent {
                 timestamp: Utc::now().timestamp_millis(),
             }],
         })
+    }
+}
+
+fn unix_millis(timestamp: SystemTime) -> i64 {
+    match timestamp.duration_since(UNIX_EPOCH) {
+        Ok(duration) => i64::try_from(duration.as_millis()).unwrap_or(i64::MAX),
+        Err(error) => -i64::try_from(error.duration().as_millis()).unwrap_or(i64::MAX),
     }
 }
 
@@ -639,7 +718,7 @@ fn event_endpoint(base: &Url) -> Url {
 
 #[cfg(test)]
 mod tests {
-    use std::io::{ErrorKind, Read, Write};
+    use std::io::ErrorKind;
     use std::net::TcpListener;
     use std::sync::Barrier;
     use std::thread;
@@ -648,6 +727,7 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+    use crate::test_support::scripted_http_server;
 
     fn test_user() -> FbUser {
         FbUser::builder("u1")
@@ -656,79 +736,23 @@ mod tests {
             .build()
     }
 
-    fn scripted_http_server(
-        statuses: impl IntoIterator<Item = u16>,
-    ) -> (String, Receiver<Vec<u8>>, thread::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
-        let address = listener
-            .local_addr()
-            .expect("test listener should have an address");
-        let statuses = statuses.into_iter().collect::<Vec<_>>();
-        let (body_sender, bodies) = bounded(statuses.len());
-        let server = thread::spawn(move || {
-            for status in statuses {
-                let (mut stream, _peer) = listener.accept().expect("event request should connect");
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .expect("test stream should configure a timeout");
-                let mut request = Vec::new();
-                let mut buffer = [0_u8; 2_048];
-                let body = loop {
-                    let read = stream
-                        .read(&mut buffer)
-                        .expect("request should be readable");
-                    assert!(read > 0, "request ended before its body was complete");
-                    request.extend_from_slice(&buffer[..read]);
-                    let Some(header_end) = request.windows(4).position(|part| part == b"\r\n\r\n")
-                    else {
-                        continue;
-                    };
-                    let body_start = header_end + 4;
-                    let headers = std::str::from_utf8(&request[..header_end])
-                        .expect("request headers should be UTF-8");
-                    let content_length = headers
-                        .lines()
-                        .find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())
-                                .flatten()
-                        })
-                        .expect("request should include content-length");
-                    if request.len() >= body_start + content_length {
-                        break request[body_start..body_start + content_length].to_vec();
-                    }
-                };
-                body_sender
-                    .send(body)
-                    .expect("test body receiver should remain available");
-                write!(
-                    stream,
-                    "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                )
-                .expect("test response should write");
-                stream.flush().expect("test response should flush");
-            }
-        });
-        (format!("http://{address}"), bodies, server)
-    }
-
     #[test]
     fn evaluation_wire_shape_matches_featbit() {
-        let event = PayloadEvent::evaluation(
-            &test_user(),
-            "checkout",
-            &Variation {
-                id: "on-id".to_owned(),
-                value: "true".to_owned(),
-            },
-            true,
-        );
+        let tracked = FbEvaluationEvent::new("checkout", "on-id", "true", true);
+        let event = PayloadEvent::evaluation(&test_user(), &tracked);
         let value = serde_json::to_value(event).expect("event should serialize");
         assert_eq!(value["user"]["keyId"], "u1");
         assert_eq!(value["variations"][0]["featureFlagKey"], "checkout");
         assert_eq!(value["variations"][0]["variation"]["id"], "on-id");
         assert_eq!(value["variations"][0]["sendToExperiment"], true);
+    }
+
+    #[test]
+    fn public_evaluation_event_debug_redacts_the_raw_value() {
+        let event = FbEvaluationEvent::new("checkout", "on-id", "private-variation-value", false);
+        let debug = format!("{event:?}");
+        assert!(debug.contains("[REDACTED]"));
+        assert!(!debug.contains("private-variation-value"));
     }
 
     #[test]

@@ -21,13 +21,13 @@ jobs:
       - name: Check formatting
         run: cargo +1.97.1 fmt --all -- --check
       - name: Run Clippy
-        run: cargo +1.97.1 clippy --all-targets --all-features -- -D warnings
+        run: cargo +1.97.1 clippy --workspace --all-targets --all-features -- -D warnings
       - name: Run tests
-        run: cargo +1.97.1 test --all-features
+        run: cargo +1.97.1 test --workspace --all-features
       - name: Run documentation tests
-        run: cargo +1.97.1 test --doc
+        run: cargo +1.97.1 test --workspace --doc
       - name: Compile examples
-        run: cargo +1.97.1 check --examples --all-features
+        run: cargo +1.97.1 check --workspace --examples --all-features
 
   rust-compatibility:
     name: Rust ${{ matrix.rust }}
@@ -41,4 +41,4 @@ jobs:
       - name: Install Rust ${{ matrix.rust }}
         run: rustup toolchain install ${{ matrix.rust }} --profile minimal
       - name: Test supported toolchain
-        run: cargo +${{ matrix.rust }} test --all-features
+        run: cargo +${{ matrix.rust }} test --workspace --all-features

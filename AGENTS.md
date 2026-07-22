@@ -114,6 +114,12 @@ Match FeatBit .NET defaults unless Rust or OpenFeature semantics require a docum
 - maximum event send attempts: 2;
 - event retry interval: 200 milliseconds.
 
+`disable_events(disable, allow_track)` is the only event-mode configuration API. `disable` controls
+automatic evaluation-event enqueueing; `allow_track` independently controls explicit evaluation and
+metric tracking. The default is `(false, true)`. The event processor is completely disabled only for
+`(true, false)` (or offline mode). README application guidance recommends `(true, true)` so exposure
+events are deferred until the application explicitly tracks them.
+
 Validate at build time:
 
 - environment secret is non-empty and structurally usable by the connection-token algorithm;
@@ -201,6 +207,15 @@ Every compatibility rule needs deterministic fixtures, including cross-language 
 
 Evaluation and `track` calls enqueue immutable payload events using a non-blocking bounded send. The background worker owns buffering, serialization, HTTP delivery, and retries.
 
+- Successful detail evaluations retain an immutable event snapshot so an application can call
+  `track_eval_event` later without re-reading a newer flag snapshot.
+- `track_eval_event` and `track_metric_event` are available exactly when the `allow_track` argument
+  of `disable_events` is true. They are no-ops when tracking is disallowed, offline mode, shutdown,
+  or a full/closed event queue prevents delivery.
+- OpenFeature users may explicitly track the current flag result through a provider-specific
+  convenience that re-evaluates the current immutable snapshot; document that a retained direct
+  detail event is required when the original result must be preserved across updates.
+
 Preserve FeatBit .NET event wire shapes:
 
 - evaluation payload contains `user`, one `variations` entry, `featureFlagKey`, `variation { id, value }`, Unix-millisecond `timestamp`, and `sendToExperiment`;
@@ -223,6 +238,12 @@ Use the standard `log` facade so the application chooses `env_logger`, `tracing-
 - `trace`: high-volume protocol diagnostics without secrets or personal data.
 
 Avoid formatting/allocation when the log level is disabled for expensive diagnostics. Log once for repetitive state until that state recovers.
+
+OpenTelemetry support belongs in a separate adapter crate. The core SDK exposes a synchronous,
+transport-neutral evaluation observer and does not depend on OpenTelemetry, install global providers,
+or configure exporters. The adapter emits `feature_flag.evaluation` semantic events through an
+application-owned logger. Context identifiers and raw variation values are excluded by default and
+require explicit opt-in. Observability events never replace or invoke FeatBit analytics tracking.
 
 ## OpenFeature adapter
 
@@ -266,7 +287,10 @@ The provider status maps `NotReady`, `Ready`, `Stale`, and terminal closed state
 ## Documentation and compatibility
 
 - All public types and methods need rustdoc with failure, fallback, lifecycle, and thread-safety behavior.
-- The README must show direct client use, OpenFeature registration, logging setup, offline/bootstrap mode, flush/close, and production TLS URLs.
+- README flag-evaluation examples must use the OpenFeature client. FeatBit-specific tracking,
+  delivery-aware flush, status, and close examples may use explicit provider/client extensions when
+  OpenFeature does not standardize the operation. Also show logging setup, offline/bootstrap mode,
+  flush/close, and production TLS URLs.
 - Examples must compile in CI and use placeholders, never real secrets.
 - Use semantic versioning. Existing public names, defaults, event shapes, evaluation results, and reconnect behavior are compatibility surfaces.
 - Unknown JSON fields must remain accepted. Removing accepted fields/operators or changing rollout results is a breaking change.
@@ -277,9 +301,9 @@ Before finishing a change, run from the repository root:
 
 ```text
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
-cargo test --doc
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+cargo test --workspace --doc
 ```
 
 Also compile with the declared MSRV in CI. Test the latest stable release plus the two preceding minor releases.

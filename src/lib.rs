@@ -12,15 +12,23 @@ mod error;
 mod evaluation;
 mod events;
 mod model;
+mod observation;
 mod open_feature;
 mod options;
 mod prepared;
 mod store;
+#[cfg(test)]
+mod test_support;
 mod worker;
 
 pub use client::{ClientStatus, EvaluationDetail, FbClient, ReasonKind};
 pub use error::ConfigError;
+pub use events::FbEvaluationEvent;
 pub use model::{FbUser, FbUserBuilder};
+pub use observation::{
+    EvaluationObservation, EvaluationObservationError, EvaluationObservationReason,
+    EvaluationObserver,
+};
 pub use open_feature::FeatBitProvider;
 pub use options::{FbOptions, FbOptionsBuilder};
 

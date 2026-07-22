@@ -12,6 +12,8 @@ The crate uses Rust edition 2021 and supports Rust 1.95.0 or newer. Register one
 - bounded, non-blocking evaluation and custom-event processing;
 - boolean, integer, float, string, and JSON/struct values;
 - direct implementation of the OpenFeature Rust `FeatureProvider` trait;
+- deferred/manual evaluation-event tracking and custom metric events;
+- an optional OpenTelemetry semantic evaluation-event adapter;
 - standard Rust `log` facade integration;
 - thread-safe clients, bounded shutdown, and fallback-returning direct APIs.
 
@@ -50,7 +52,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // asynchronous worker threads.
     let provider =
         tokio::task::spawn_blocking(move || FeatBitProvider::new(options)).await?;
-    let featbit = provider.client().clone();
+    let extensions = provider.clone();
 
     let client = {
         let mut api = OpenFeature::singleton_mut().await;
@@ -72,7 +74,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
 
     OpenFeature::singleton_mut().await.shutdown().await;
-    tokio::task::spawn_blocking(move || featbit.close()).await?;
+    tokio::task::spawn_blocking(move || extensions.client().close()).await?;
     Ok(())
 }
 ```
@@ -81,21 +83,127 @@ OpenFeature requires a non-empty targeting key. Provider failures use standard O
 
 ## FeatBit-specific extensions
 
-Keep the handle returned by `provider.client()` only when the application needs FeatBit-specific operations that OpenFeature 0.3 does not standardize, such as custom metrics, delivery-aware flush, readiness details, or explicit bounded close:
+All flag resolution should use the OpenFeature client. OpenFeature 0.3 does not standardize custom
+metric events, delivery-aware flush, readiness details, or explicit bounded close, so keep a clone of
+`FeatBitProvider` only when the application needs those FeatBit-specific extensions:
 
 ```rust,no_run
 use std::time::Duration;
 
-use featbit_server_sdk::FbUser;
+use featbit_server_sdk::FeatBitProvider;
+use open_feature::EvaluationContext;
 
-# fn example(featbit: &featbit_server_sdk::FbClient) {
-let user = FbUser::builder("user-123").name("Ada").build();
-featbit.track(&user, "checkout-opened");
-let _delivered = featbit.flush_and_wait(Duration::from_secs(2));
+# fn example(
+#     provider: &FeatBitProvider,
+#     context: &EvaluationContext,
+# ) -> Result<(), open_feature::EvaluationError> {
+let _accepted = provider.track_metric_event(context, "checkout-opened", 1.0)?;
+let _delivered = provider
+    .client()
+    .flush_and_wait(Duration::from_secs(2));
+# Ok(())
 # }
 ```
 
-Flag evaluation should continue through the OpenFeature client. The direct variation methods remain available for compatibility and specialized integrations.
+The provider extensions use the same OpenFeature `EvaluationContext` mapping as flag resolution.
+The direct variation methods remain available for compatibility and specialized integrations, but
+README examples intentionally use OpenFeature for application-facing evaluation.
+
+### Deferred evaluation and metric events
+
+The recommended event configuration defers evaluation-event delivery until an OpenFeature
+resolution becomes a real exposure. Disable automatic evaluation events, keep explicit tracking
+available, and call the provider tracking extension only after exposure:
+
+```rust,no_run
+use std::time::Duration;
+
+use featbit_server_sdk::{FbOptions, FeatBitProvider};
+use open_feature::{EvaluationContext, OpenFeature};
+
+# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+let options = FbOptions::builder("environment-secret")
+    .disable_events(
+        true, // disable automatic evaluation events for deferred exposure tracking
+        true, // allow explicit evaluation and metric tracking
+    )
+    .build()?;
+let provider = FeatBitProvider::new(options);
+let extensions = provider.clone();
+let client = {
+    let mut api = OpenFeature::singleton_mut().await;
+    api.set_provider(provider).await;
+    api.create_client()
+};
+let context = EvaluationContext::default().with_targeting_key("user-123");
+
+let detail = client
+    .get_bool_details("new-checkout", Some(&context), None)
+    .await?;
+if user_was_exposed_to_the_result() {
+    let _accepted = extensions
+        .track_eval_event_for_flag(&context, &detail.flag_key)?;
+}
+
+let _accepted = extensions
+    .track_metric_event(&context, "checkout-completed", 1.0)?;
+let _delivered = extensions
+    .client()
+    .flush_and_wait(Duration::from_secs(2));
+OpenFeature::singleton_mut().await.shutdown().await;
+# extensions.client().close();
+# Ok(())
+# }
+# fn user_was_exposed_to_the_result() -> bool { true }
+```
+
+`track_eval_event_for_flag` re-evaluates against the current snapshot because OpenFeature 0.3 details
+cannot carry a provider-specific event token. Call it promptly after resolution; an intervening flag
+update can change the variation recorded by the event.
+
+`disable_events(disable, allow_track)` is the single event-mode setting:
+
+| Configuration | Automatic evaluation events | Explicit evaluation/metric tracking |
+| --- | --- | --- |
+| `disable_events(false, true)` (SDK default) | enabled | allowed |
+| `disable_events(false, false)` | enabled | rejected |
+| `disable_events(true, true)` (recommended deferred mode) | disabled | allowed |
+| `disable_events(true, false)` | disabled | rejected; event processor is not started |
+
+## OpenTelemetry evaluation events
+
+The separate `featbit-server-sdk-opentelemetry` crate implements `EvaluationObserver` without adding
+OpenTelemetry dependencies to the core SDK. It emits the semantic event `feature_flag.evaluation`
+through an application-owned OpenTelemetry logger. Configure that logger with a batch processor so
+exporter I/O never runs on an evaluation thread:
+
+```toml
+[dependencies]
+featbit-server-sdk = "0.1"
+featbit-server-sdk-opentelemetry = "0.1"
+opentelemetry = { version = "0.32", features = ["logs", "trace"] }
+```
+
+```rust,ignore
+use featbit_server_sdk::{FbOptions, FeatBitProvider};
+use featbit_server_sdk_opentelemetry::OpenTelemetryEvaluationObserver;
+use open_feature::OpenFeature;
+use opentelemetry::logs::LoggerProvider as _;
+
+// The application owns and configures this provider and its OTLP exporter.
+let logger = logger_provider.logger("featbit-server-sdk");
+let observer = OpenTelemetryEvaluationObserver::new(logger);
+let options = FbOptions::builder("environment-secret")
+    .evaluation_observer(observer)
+    .build()?;
+let provider = FeatBitProvider::new(options);
+OpenFeature::singleton_mut().await.set_provider(provider).await;
+```
+
+Context identifiers and raw variation values are excluded by default. They can be enabled explicitly
+with `with_context_id(true)` and `with_value(true)`. The adapter remains active independently of
+FeatBit analytics settings and never invokes `track_eval_event` or `track_metric_event`, so it cannot
+duplicate events sent to the FeatBit server.
 
 ## Axum web application
 
@@ -135,7 +243,7 @@ use open_feature::OpenFeature;
 let bootstrap = std::fs::read_to_string("featbit-bootstrap.json")?;
 let options = FbOptions::builder("offline-placeholder")
     .offline(true)
-    .disable_events(true)
+    .disable_events(true, false)
     .bootstrap_json(bootstrap)
     .build()?;
 let provider = FeatBitProvider::new(options);
@@ -160,9 +268,9 @@ The long-lived design and compatibility rules are in [`AGENTS.md`](AGENTS.md). B
 
 ```text
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features
-cargo test --doc
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+cargo test --workspace --doc
 ```
 
 The explicitly authorized, bounded FeatBit Cloud stress project is documented in

@@ -662,7 +662,7 @@ mod tests {
 
         let options = FbOptionsBuilder::new("valid-environment-secret")
             .streaming_url(format!("ws://{address}"))
-            .disable_events(true)
+            .disable_events(true, false)
             .start_wait(Duration::from_secs(2))
             .connect_timeout(Duration::from_secs(1))
             .close_timeout(Duration::from_secs(1))
@@ -702,7 +702,7 @@ mod tests {
             .expect("listener should have an address");
         let options = FbOptionsBuilder::new("valid-environment-secret")
             .streaming_url(format!("ws://{address}"))
-            .disable_events(true)
+            .disable_events(true, false)
             .start_wait(Duration::from_secs(30))
             .connect_timeout(Duration::from_secs(30))
             .close_timeout(Duration::from_millis(400))
@@ -778,7 +778,7 @@ mod tests {
 
         let options = FbOptionsBuilder::new("valid-environment-secret")
             .streaming_url(format!("ws://{address}"))
-            .disable_events(true)
+            .disable_events(true, false)
             .start_wait(Duration::from_secs(2))
             .connect_timeout(Duration::from_secs(1))
             .close_timeout(Duration::from_secs(1))
@@ -893,7 +893,7 @@ mod tests {
 
         let options = FbOptionsBuilder::new("valid-environment-secret")
             .streaming_url(format!("ws://{address}"))
-            .disable_events(true)
+            .disable_events(true, false)
             .start_wait(Duration::from_secs(2))
             .connect_timeout(Duration::from_secs(1))
             .close_timeout(Duration::from_secs(1))
@@ -964,7 +964,7 @@ mod tests {
 
         let options = FbOptionsBuilder::new("valid-environment-secret")
             .streaming_url(format!("ws://{address}"))
-            .disable_events(true)
+            .disable_events(true, false)
             .start_wait(Duration::from_secs(1))
             .connect_timeout(Duration::from_millis(100))
             .close_timeout(Duration::from_secs(1))
@@ -1073,7 +1073,7 @@ mod tests {
 
         let options = FbOptionsBuilder::new("valid-environment-secret")
             .streaming_url(format!("ws://{address}"))
-            .disable_events(true)
+            .disable_events(true, false)
             .start_wait(Duration::from_secs(2))
             .connect_timeout(Duration::from_secs(1))
             .close_timeout(Duration::from_secs(1))
