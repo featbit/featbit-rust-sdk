@@ -12,6 +12,10 @@ readme = "README.md"
 keywords = ["featbit", "feature-flags", "openfeature", "server-sdk"]
 categories = ["api-bindings", "web-programming"]
 
+[[example]]
+name = "cloud_axum_extreme"
+path = "examples/test/cloud_axum_extreme.rs"
+
 [dependencies]
 arc-swap = "1.7"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

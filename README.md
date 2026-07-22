@@ -165,6 +165,10 @@ cargo test --all-features
 cargo test --doc
 ```
 
+The explicitly authorized, bounded FeatBit Cloud stress project is documented in
+[`examples/test/README.md`](examples/test/README.md). It exercises live updates through a local
+Axum application and the OpenFeature API without storing credentials in the repository.
+
 ## License
 
 Licensed under the Apache License, Version 2.0. See [`LICENSE`](LICENSE).
