@@ -28,6 +28,8 @@ jobs:
         run: cargo +1.97.1 test --workspace --doc
       - name: Compile examples
         run: cargo +1.97.1 check --workspace --examples --all-features
+      - name: Test release tooling
+        run: python3 -m unittest discover -s scripts/tests -p "test_*.py"
 
   rust-compatibility:
     name: Rust ${{ matrix.rust }}

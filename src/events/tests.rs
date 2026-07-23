@@ -175,10 +175,11 @@ fn queue_overflow_warning_state_is_suppressed_until_the_queue_recovers() {
 #[test]
 fn processor_posts_authorized_event_batch() {
     let mut server = mockito::Server::new();
+    let user_agent = crate::user_agent();
     let request = server
         .mock("POST", "/api/public/insight/track")
         .match_header("authorization", "valid-secret")
-        .match_header("user-agent", "featbit-rust-server-sdk/0.1.0")
+        .match_header("user-agent", user_agent.as_str())
         .match_header("content-type", "application/json; charset=utf-8")
         .match_body(Matcher::Regex(
             ".*\\\"eventName\\\":\\\"purchase\\\".*".into(),

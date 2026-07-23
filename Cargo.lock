@@ -430,7 +430,7 @@ dependencies = [
 
 [[package]]
 name = "featbit-server-sdk"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "arc-swap",
  "axum",
@@ -462,7 +462,7 @@ dependencies = [
 
 [[package]]
 name = "featbit-server-sdk-opentelemetry"
-version = "0.1.0"
+version = "0.1.0-beta.1"
 dependencies = [
  "featbit-server-sdk",
  "opentelemetry",

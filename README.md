@@ -6,7 +6,7 @@ The FeatBit server-side SDK for Rust synchronizes feature flags in the backgroun
 
 ```toml
 [dependencies]
-featbit-server-sdk = "0.1"
+featbit-server-sdk = "0.1.0-beta.1"
 
 # The SDK uses the `log` facade. Your application chooses the logger.
 env_logger = "0.11"
@@ -146,7 +146,7 @@ Add the OpenFeature and Tokio dependencies:
 
 ```toml
 [dependencies]
-featbit-server-sdk = "0.1"
+featbit-server-sdk = "0.1.0-beta.1"
 open-feature = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
@@ -282,6 +282,7 @@ cargo test --workspace --doc
 ```
 
 The bounded FeatBit Cloud stress project is documented in [`examples/test/README.md`](examples/test/README.md).
+The crates.io approval, versioning, prerelease, and recovery workflow is documented in [`RELEASING.md`](RELEASING.md).
 
 ## License
 
