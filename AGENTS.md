@@ -4,7 +4,9 @@ This file defines the long-lived engineering constraints for this repository. It
 
 ## Product intent
 
-Build a production-grade, server-side FeatBit SDK for long-lived, multi-user services. The primary integration is an OpenFeature `FeatureProvider`; the crate may also expose an idiomatic FeatBit client for direct use. A process should normally create one provider/client per FeatBit environment and reuse it for the process lifetime.
+Build a production-grade, server-side FeatBit SDK for long-lived, multi-user services. `FbClient`
+is the primary application API. A process should normally create one client per FeatBit environment
+and reuse it for the process lifetime.
 
 The SDK must provide these capabilities as one coherent system:
 
@@ -14,17 +16,24 @@ The SDK must provide these capabilities as one coherent system:
 - deterministic local feature-flag and segment evaluation;
 - integration with the Rust `log` facade;
 - thread-safe, low-latency evaluation and graceful, idempotent shutdown;
-- direct conformance to the official OpenFeature Rust provider interface.
+- a transport-neutral raw evaluation boundary that external adapter crates can use without copying
+  the evaluator.
 
 ## Protocol authority and decision records
 
-Before a major version or protocol change, verify observable behavior against the authoritative protocol and public-contract sources. The initial implementation recorded these source revisions on 2026-07-21:
+Before a major version or protocol change, verify observable behavior against the authoritative
+protocol and public-contract sources. The initial implementation recorded this source revision on
+2026-07-21:
 
 - FeatBit .NET Server SDK, commit `974e2a7a557095b300e4e89da86df7d6fa894963`: <https://github.com/featbit/featbit-dotnet-sdk>
-- OpenFeature Rust SDK 0.3.0, commit `abe65b862149347b7a08385c60f738eebafd444f`: <https://github.com/open-feature/rust-sdk>
-- OpenFeature Rust getting-started guide: <https://openfeature.dev/docs/tutorials/getting-started/rust/>
 
-FeatBit .NET defines the expected FeatBit behavior and wire format. OpenFeature defines the public provider contract. Rust API shape, runtime ownership, builder patterns, bounded event delivery, documentation, and quality gates are independent repository decisions defined by this guide and justified through tests and benchmarks.
+FeatBit .NET defines the expected FeatBit behavior and wire format. Rust API shape, runtime
+ownership, builder patterns, bounded event delivery, documentation, and quality gates are
+independent repository decisions defined by this guide and justified through tests and benchmarks.
+
+OpenFeature conformance is owned by the separate
+<https://github.com/featbit/openfeature-provider-rust-server> repository. The repositories were
+split on 2026-07-23 so this core crate does not depend on an external feature-flag standard.
 
 Implement observable behavior and protocol semantics independently in idiomatic Rust. Record decisions here as requirements, rationale, and deterministic fixtures instead of depending on another SDK's internal implementation details.
 
@@ -45,10 +54,10 @@ Use explicit component boundaries rather than a monolithic client:
 FbOptions / FbOptionsBuilder
             |
             v
-     FbClient facade  <---->  FeatBitProvider (OpenFeature adapter)
-       /     |     \
-      v      v      v
-data sync  evaluator  event processor
+     FbClient facade <----> RawEvaluation adapter boundary
+       /     |     \                    ^
+      v      v      v                    |
+data sync  evaluator  event processor    +---- external adapter crates
       |      |             |
       v      v             v
  atomic in-memory       HTTP event endpoint
@@ -63,7 +72,9 @@ Apply these patterns consistently:
 - **Strategy:** evaluator operators and data/event transports are replaceable implementation strategies, not condition-heavy code in the facade.
 - **Producer/consumer:** evaluation threads enqueue events without waiting for network I/O; one background consumer owns batching and delivery.
 - **Immutable snapshot / copy-on-write:** readers load an `Arc` snapshot atomically. Full updates replace the snapshot; version-valid patches derive and atomically publish a new snapshot. Evaluation must not take a contended write lock.
-- **Adapter:** `FeatBitProvider` maps OpenFeature types and reasons directly to the same evaluator used by `FbClient`; never maintain a second evaluation engine.
+- **Adapter boundary:** `RawEvaluation` exposes reason, metadata, and the captured event without
+  importing an external standard. External adapters must complete or observe the same evaluation;
+  never maintain a second evaluation engine.
 
 Suggested module ownership:
 
@@ -75,7 +86,6 @@ src/store.rs               immutable snapshot store
 src/data_sync.rs           WebSocket protocol and reconnect loop
 src/evaluation/            evaluator, operators, rollout algorithm
 src/events.rs              queue, serialization, batching, HTTP sender
-src/open_feature.rs        OpenFeature adapter and type mapping
 src/error.rs               configuration and internal error taxonomy
 ```
 
@@ -88,17 +98,22 @@ Public application-facing operations must not panic. In particular, constructors
 - Use `Result` for configuration errors and operations where the caller explicitly asks for diagnostic failure. A typed `Result` is the Rust equivalent of a safe error return, not an exception.
 - Direct value-only variation methods always return the caller's fallback on not-ready, not-found, malformed data, wrong type, invalid context, or internal failure.
 - Direct detail methods return the fallback plus a stable reason/error classification.
-- OpenFeature provider methods return the standard `EvaluationError` required by its trait. Map errors precisely; do not invent string-only error protocols.
-- Background failures update client/provider status and are logged. Recoverable failures retry; unrecoverable authentication/configuration failures stop the affected worker.
+- `evaluate_raw` returns typed `EvaluationError` values and never records a successful evaluation
+  until the caller invokes `complete_raw_evaluation`.
+- Adapter-side conversion failures may be reported through `observe_evaluation_error`; these calls
+  never enqueue FeatBit analytics.
+- Background failures update client status and are logged. Recoverable failures retry;
+  unrecoverable authentication/configuration failures stop the affected worker.
 - Do not use `unwrap`, `expect`, indexing, unchecked slicing, `todo!`, `unimplemented!`, or deliberate `panic!` in non-test execution paths. If an invariant truly cannot be represented otherwise, document and test it before allowing a narrowly scoped exception.
 - Do not use `catch_unwind` to hide routine bugs. Prevent panics through checked parsing and total state machines.
 - Lock and channel failures must degrade safely. Prefer non-poisoning synchronization primitives where appropriate.
 - All waits and I/O are bounded by configuration or shutdown timeouts. Evaluation itself performs no I/O and never blocks on a worker.
-- Shutdown and flush are idempotent. Dropping the final client/provider handle performs a best-effort bounded shutdown; applications should still call `close` explicitly when they need a delivery guarantee.
+- Shutdown and flush are idempotent. Dropping the final client handle performs a best-effort bounded
+  shutdown; applications should still call `close` explicitly when they need a delivery guarantee.
 
 ## `FbOptions` contract
 
-Match FeatBit .NET defaults unless Rust or OpenFeature semantics require a documented difference:
+Match FeatBit .NET defaults unless Rust semantics require a documented difference:
 
 - start wait: 5 seconds;
 - streaming URL: `ws://localhost:5100`;
@@ -155,13 +170,14 @@ Client status mapping is stable:
 - starting and never initialized -> `NotReady`;
 - synchronized -> `Ready`;
 - previously initialized but disconnected/reconnecting -> `Stale`;
-- explicitly closed or unrecoverably stopped -> `Closed`/OpenFeature `Error`.
+- explicitly closed or unrecoverably stopped -> `Closed`.
 
 Offline mode performs no network calls. A valid bootstrap snapshot makes it immediately ready; an empty offline store is still operational but unknown flags resolve to fallbacks.
 
 ## Store and concurrency
 
-- The client, provider, store, synchronizer, evaluator, and event processor must be `Send + Sync` where exposed across threads.
+- The client, raw evaluation boundary, store, synchronizer, evaluator, and event processor must be
+  `Send + Sync` where exposed across threads.
 - Keep all shared ownership explicit with `Arc`; avoid global mutable SDK state.
 - Evaluation reads one consistent snapshot for the whole evaluation. Never mix a flag from one snapshot with segments from another.
 - Never hold a lock across `.await`, socket I/O, HTTP I/O, logging callbacks, or user code.
@@ -212,9 +228,9 @@ Evaluation and `track` calls enqueue immutable payload events using a non-blocki
 - `track_eval_event` and `track_metric_event` are available exactly when the `allow_track` argument
   of `disable_events` is true. They are no-ops when tracking is disallowed, offline mode, shutdown,
   or a full/closed event queue prevents delivery.
-- OpenFeature users may explicitly track the current flag result through a provider-specific
-  convenience that re-evaluates the current immutable snapshot; document that a retained direct
-  detail event is required when the original result must be preserved across updates.
+- Integrations may explicitly track the current flag result through a convenience that re-evaluates
+  the current immutable snapshot; document that a retained direct detail event is required when the
+  original result must be preserved across updates.
 
 Preserve FeatBit .NET event wire shapes:
 
@@ -245,34 +261,26 @@ or configure exporters. The adapter emits `feature_flag.evaluation` semantic eve
 application-owned logger. Context identifiers and raw variation values are excluded by default and
 require explicit opt-in. Observability events never replace or invoke FeatBit analytics tracking.
 
-## OpenFeature adapter
+## External adapter boundary
 
-`FeatBitProvider` is a first-class public type implementing the official `open_feature::provider::FeatureProvider` trait. Pin to a compatible `open-feature` release and treat trait changes as public API changes.
+This crate must not depend on OpenFeature or another vendor-neutral feature-flag API. External
+adapters depend on this crate and use:
 
-Context mapping:
+- `evaluate_raw` to obtain one successful FeatBit result without recording success;
+- `RawEvaluation` getters for the raw string value, flag/variation metadata, protocol-level reason,
+  and immutable event snapshot;
+- `complete_raw_evaluation` only after adapter-side conversion succeeds;
+- `observe_evaluation_error` for context or conversion errors that happen outside the core;
+- the existing client status, tracking, flush, and close APIs for lifecycle extensions.
 
-- OpenFeature `targeting_key` -> FeatBit `keyId` and is required for targeted/rollout evaluation;
-- custom field `name` -> FeatBit user name;
-- primitive custom fields -> invariant string values in `customizedProperties`;
-- datetime -> RFC 3339 string;
-- supported structured fields -> stable JSON; unsupported `Any` values are ignored with debug logging, never downcast with an assumption.
+`EvaluationReason` preserves disabled, direct target, named rule, fallthrough, and percentage-split
+information without importing types from another standard. `EvaluationError` preserves not-ready,
+missing-targeting-key, not-found, and malformed-flag classifications.
 
-Resolution mapping:
-
-- flag off -> `EvaluationReason::Disabled`;
-- direct target or rule match -> `EvaluationReason::TargetingMatch`;
-- percentage rollout selection -> `EvaluationReason::Split` when applicable;
-- ordinary fallthrough -> `EvaluationReason::Default`;
-- variation ID -> OpenFeature `variant`;
-- not initialized -> `ProviderNotReady`;
-- unknown flag -> `FlagNotFound`;
-- missing targeting key -> `TargetingKeyMissing`;
-- malformed remote value -> `ParseError`;
-- requested type mismatch -> `TypeMismatch`.
-
-OpenFeature bool, integer, float, string, and struct resolutions all use the same string variation result. Struct resolution parses JSON recursively into OpenFeature `StructValue`; unsupported/null shapes return a typed error.
-
-The provider status maps `NotReady`, `Ready`, `Stale`, and terminal closed state without masking stale data. Provider drop delegates to the client's best-effort idempotent shutdown.
+Public raw types remain protocol-neutral and intentional. Do not expose the snapshot, evaluator,
+wire models, internal transport traits, or mutable event processor merely to make an adapter easier.
+The OpenFeature adapter and its conformance tests belong only in
+<https://github.com/featbit/openfeature-provider-rust-server>.
 
 ## Dependencies and supply chain
 
@@ -287,11 +295,13 @@ The provider status maps `NotReady`, `Ready`, `Stale`, and terminal closed state
 ## Documentation and compatibility
 
 - All public types and methods need rustdoc with failure, fallback, lifecycle, and thread-safety behavior.
-- README usage guidance must introduce direct `FbClient` flag evaluation and lifecycle best
-  practices first, then document the OpenFeature client/provider integration. Link to compiling
-  console and Axum examples for both paths. FeatBit-specific tracking, delivery-aware flush, status,
-  and close examples may use direct client/provider extensions. Also show logging setup,
-  offline/bootstrap mode, flush/close, and production TLS URLs.
+- README structure follows the FeatBit .NET SDK: Introduction, Data Synchronization, Get Started,
+  SDK, supported Rust versions, support, and related links. Keep Rust-specific logging,
+  offline/bootstrap, bounded event delivery, deferred tracking, status, flush/close, raw adapter,
+  and OpenTelemetry guidance.
+- Mention and link the separate OpenFeature provider, but do not duplicate its setup or API
+  documentation here.
+- Link to compiling console and Axum examples for direct `FbClient` usage.
 - Examples must compile in CI and use placeholders, never real secrets.
 - Use semantic versioning. Existing public names, defaults, event shapes, evaluation results, and reconnect behavior are compatibility surfaces.
 - Unknown JSON fields must remain accepted. Removing accepted fields/operators or changing rollout results is a breaking change.
@@ -315,7 +325,7 @@ Testing layers:
 - store tests for atomic full replacement, tombstones, stale patches, and snapshot consistency;
 - deterministic WebSocket tests for initial sync, patch sync, ping, reconnect, malformed messages, close 4003, and shutdown;
 - HTTP tests for batching, headers, retry classification, timeout, queue overflow, flush, and close;
-- OpenFeature conformance-style tests for every supported type and status/error mapping;
+- raw adapter-boundary tests for metadata, reason/error mapping, completion, and observation;
 - concurrency/stress tests suitable for normal CI; benchmarks for evaluator hot paths when performance changes.
 
 Tests may use `unwrap`/`expect` when it makes an assertion clearer. Production code may not inherit that exception.
@@ -330,4 +340,5 @@ A change is complete only when:
 - network and shutdown paths are bounded and cancelable;
 - evaluation remains deterministic, local, and non-panicking;
 - formatting, Clippy, tests, doc tests, and MSRV checks pass;
-- deviations from the FeatBit .NET protocol, this repository's architecture rules, or the OpenFeature contract are explicitly documented.
+- deviations from the FeatBit .NET protocol or this repository's architecture rules are explicitly
+  documented.

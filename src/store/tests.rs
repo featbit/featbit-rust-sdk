@@ -3,7 +3,7 @@ use std::thread;
 
 use super::*;
 use crate::evaluation::test_support::{basic_flag, rollout};
-use crate::evaluation::{EvalReason, Evaluator};
+use crate::evaluation::{EvaluationReason, Evaluator};
 use crate::model::FbUser;
 use crate::model::{Condition, TargetRule};
 use crate::prepared::{PreparedCondition, IS_IN_SEGMENT};
@@ -321,7 +321,7 @@ fn concurrent_evaluation_never_observes_a_partial_flag_and_segment_patch() {
                     let result = Evaluator::evaluate(&snapshot, "patch-consistent", &user)
                         .expect("every atomically published patch should evaluate");
                     assert_eq!(result.variation.value, "false");
-                    assert!(matches!(result.reason, EvalReason::RuleMatch { .. }));
+                    assert!(matches!(result.reason, EvaluationReason::RuleMatch { .. }));
                 }
             })
         })

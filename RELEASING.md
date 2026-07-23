@@ -16,6 +16,13 @@ crates.io index, and then publishes the OpenTelemetry adapter. It writes the
 selected version to both manifests and `Cargo.lock`, pushes that release commit
 to `main`, creates `v<VERSION>`, and creates a GitHub Release.
 
+The OpenFeature provider is released independently from
+[`featbit/openfeature-provider-rust-server`](https://github.com/featbit/openfeature-provider-rust-server).
+For the repository split, publish the core workspace `0.1.0-beta.2` before publishing provider
+`0.1.0-beta.1`; the provider package requires the new protocol-neutral raw evaluation API. Enter
+`0.1.0-beta.2` explicitly in the core release workflow because leaving the version blank selects the
+next stable patch.
+
 ## One-time setup
 
 ### 1. Bootstrap both crate names

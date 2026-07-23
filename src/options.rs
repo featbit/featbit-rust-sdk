@@ -29,7 +29,7 @@ const DEFAULT_RECONNECT_DELAYS: [Duration; 10] = [
     Duration::from_secs(55),
 ];
 
-/// Immutable configuration for [`crate::FbClient`] and [`crate::FeatBitProvider`].
+/// Immutable configuration for [`crate::FbClient`].
 ///
 /// Construct options with [`FbOptionsBuilder`]. Cloning this value is inexpensive and never
 /// exposes the environment secret through `Debug` output.

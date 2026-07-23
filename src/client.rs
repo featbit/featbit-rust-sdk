@@ -13,7 +13,7 @@ use crate::store::SnapshotStore;
 
 mod evaluation;
 
-pub(crate) use evaluation::ClientEvaluationError;
+pub use evaluation::{EvaluationError, RawEvaluation};
 
 /// Current lifecycle/readiness state of an [`FbClient`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -225,11 +225,11 @@ impl FbClient {
 
     /// Re-evaluates `flag_key` against the current snapshot and records that evaluation event.
     ///
-    /// This convenience is useful after an `OpenFeature` resolution, whose standard detail type
-    /// cannot carry [`FbEvaluationEvent`]. Call it promptly after the original resolution. If an
-    /// intervening flag update must not change the reported variation, use a direct detail method
-    /// and pass its captured event to [`Self::track_eval_event`] instead. Calling this while
-    /// automatic evaluation events are enabled records an additional event.
+    /// This convenience is useful after an integration returns a detail type that cannot carry
+    /// [`FbEvaluationEvent`]. Call it promptly after the original resolution. If an intervening flag
+    /// update must not change the reported variation, use a direct detail method and pass its
+    /// captured event to [`Self::track_eval_event`] instead. Calling this while automatic evaluation
+    /// events are enabled records an additional event.
     #[must_use]
     pub fn track_eval_event_for_flag(&self, user: &FbUser, flag_key: &str) -> bool {
         if !self.tracking_available() {
