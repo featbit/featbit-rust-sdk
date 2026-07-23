@@ -23,6 +23,8 @@ crates.io can only configure Trusted Publishing after a crate exists. An owner
 must therefore publish each crate once with a personal, narrowly scoped
 crates.io token. From a clean, reviewed `main` checkout:
 
+The initial bootstrap version is `0.1.0-beta.1`.
+
 ```text
 cargo login
 
@@ -38,7 +40,7 @@ cargo publish --locked -p featbit-server-sdk
 Wait until the exact core version is visible:
 
 ```text
-cargo info featbit-server-sdk@0.1.0
+cargo info featbit-server-sdk@0.1.0-beta.1
 ```
 
 Then publish the adapter:

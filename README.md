@@ -6,7 +6,7 @@ The FeatBit server-side SDK for Rust synchronizes feature flags in the backgroun
 
 ```toml
 [dependencies]
-featbit-server-sdk = "0.1"
+featbit-server-sdk = "0.1.0-beta.1"
 
 # The SDK uses the `log` facade. Your application chooses the logger.
 env_logger = "0.11"
@@ -146,7 +146,7 @@ Add the OpenFeature and Tokio dependencies:
 
 ```toml
 [dependencies]
-featbit-server-sdk = "0.1"
+featbit-server-sdk = "0.1.0-beta.1"
 open-feature = "0.3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
