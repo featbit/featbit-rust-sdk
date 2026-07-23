@@ -5,10 +5,11 @@ The repository publishes two crates in one lockstep release:
 - `featbit-server-sdk`
 - `featbit-server-sdk-opentelemetry`
 
-`.github/workflows/release.yml` runs for every non-bot push to `main`, including a
-merged pull request. It verifies the selected commit and then waits at the
-`crates-io-release` GitHub Environment. Nothing is uploaded until a required
-reviewer approves that deployment.
+`.github/workflows/release.yml` only runs when a maintainer starts it with
+**Actions → Release crates.io → Run workflow**. Pushes and merged pull requests
+do not start a release. The workflow verifies the selected `main` commit and
+then waits at the `crates-io-release` GitHub Environment. Nothing is uploaded
+until a required reviewer approves that deployment.
 
 The workflow publishes the core crate first, waits for it to appear in the
 crates.io index, and then publishes the OpenTelemetry adapter. It writes the
@@ -93,14 +94,15 @@ release workflow a narrowly scoped bypass for its bot-authored
 `chore(release): ...` commit, or change the version update to a release-PR model
 before enabling the rule.
 
-## Normal patch release
+## Manual patch release
 
-Every new commit on `main` starts a release run:
+Pushes and merges never start a release run. To publish the next patch:
 
-1. The workflow calculates the candidate version and runs all quality gates.
-2. Open the run and review the planned version and commit.
-3. Select **Review deployments**.
-4. Approve `crates-io-release`.
+1. Choose **Actions → Release crates.io → Run workflow**.
+2. Select `main`, leave `version` blank, and select **Run workflow**.
+3. Review the planned version, source commit, and quality gates.
+4. Select **Review deployments**.
+5. Approve `crates-io-release`.
 
 With no explicit version, the workflow takes the newer of the manifest version
 and latest completed workspace release, removes any prerelease suffix, and
@@ -138,9 +140,8 @@ workspace, except when resuming a partial release. To promote
 `0.2.0-beta.2` to stable, explicitly request `0.2.0`; leaving the field empty
 would perform the documented patch increment instead.
 
-If an automatic run is already waiting for approval and a different explicit
-version is required, cancel or reject that pending run before dispatching the
-manual one.
+If another run is already waiting for approval and a different explicit version
+is required, cancel or reject that pending run before dispatching a new one.
 
 ## Failure recovery
 

@@ -1,9 +1,6 @@
 name: Release crates.io
 
 on:
-  push:
-    branches:
-      - main
   workflow_dispatch:
     inputs:
       version:
@@ -24,7 +21,6 @@ env:
 jobs:
   plan:
     name: Plan release
-    if: github.event_name == 'workflow_dispatch' || github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.plan.outputs.version }}
