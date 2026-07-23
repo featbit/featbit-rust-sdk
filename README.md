@@ -282,6 +282,7 @@ cargo test --workspace --doc
 ```
 
 The bounded FeatBit Cloud stress project is documented in [`examples/test/README.md`](examples/test/README.md).
+The crates.io approval, versioning, prerelease, and recovery workflow is documented in [`RELEASING.md`](RELEASING.md).
 
 ## License
 

@@ -1,0 +1,303 @@
+name: Release crates.io
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact SemVer (for example 1.2.0-beta.1); blank increments patch
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: crates-io-release
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  plan:
+    name: Plan release
+    if: github.event_name == 'workflow_dispatch' || github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      is_prerelease: ${{ steps.plan.outputs.is_prerelease }}
+      core_published: ${{ steps.plan.outputs.core_published }}
+      adapter_published: ${{ steps.plan.outputs.adapter_published }}
+      source_sha: ${{ steps.source.outputs.source_sha }}
+      resume: ${{ steps.source.outputs.resume }}
+    steps:
+      - name: Check out triggering source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 2
+
+      - name: Resolve release source
+        id: source
+        run: >-
+          python3 scripts/release.py source
+          --trigger-sha "$GITHUB_SHA"
+          --git-ref "$GITHUB_REF"
+          --github-output "$GITHUB_OUTPUT"
+
+      - name: Select exact source commit
+        env:
+          SOURCE_SHA: ${{ steps.source.outputs.source_sha }}
+        run: git checkout --detach "$SOURCE_SHA"
+
+      - name: Calculate release version
+        id: plan
+        env:
+          REQUESTED_VERSION: ${{ github.event.inputs.version || steps.source.outputs.resume_version }}
+          RESUME_RELEASE: ${{ steps.source.outputs.resume }}
+        shell: bash
+        run: |
+          args=(
+            plan
+            --requested "$REQUESTED_VERSION"
+            --github-output "$GITHUB_OUTPUT"
+            --summary "$GITHUB_STEP_SUMMARY"
+          )
+          if [[ "$RESUME_RELEASE" == "true" ]]; then
+            args+=(--allow-complete)
+          fi
+          python3 scripts/release.py "${args[@]}"
+
+  verify:
+    name: Verify v${{ needs.plan.outputs.version }}
+    needs: plan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out release source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.plan.outputs.source_sha }}
+
+      - name: Install Rust toolchain
+        run: >-
+          rustup toolchain install 1.97.1
+          --profile minimal
+          --component rustfmt
+          --component clippy
+
+      - name: Set lockstep workspace version
+        run: python3 scripts/release.py set-version "${{ needs.plan.outputs.version }}"
+
+      - name: Test release tooling
+        run: python3 -m unittest discover -s scripts/tests -p "test_*.py"
+
+      - name: Check formatting
+        run: cargo +1.97.1 fmt --all -- --check
+
+      - name: Run Clippy
+        run: >-
+          cargo +1.97.1 clippy
+          --workspace
+          --all-targets
+          --all-features
+          --
+          -D warnings
+
+      - name: Run tests
+        run: cargo +1.97.1 test --workspace --all-features
+
+      - name: Run documentation tests
+        run: cargo +1.97.1 test --workspace --doc
+
+      - name: Verify core crate package
+        run: >-
+          cargo +1.97.1 publish
+          --dry-run
+          --allow-dirty
+          --locked
+          -p featbit-server-sdk
+
+  publish:
+    name: Approve and publish v${{ needs.plan.outputs.version }}
+    needs:
+      - plan
+      - verify
+    runs-on: ubuntu-latest
+    environment:
+      name: crates-io-release
+      url: https://crates.io/crates/featbit-server-sdk/${{ needs.plan.outputs.version }}
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Check out verified source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.plan.outputs.source_sha }}
+
+      - name: Reject a stale release
+        env:
+          SOURCE_SHA: ${{ needs.plan.outputs.source_sha }}
+        shell: bash
+        run: |
+          git fetch origin main --tags
+          main_sha="$(git rev-parse origin/main)"
+          if [[ "$main_sha" != "$SOURCE_SHA" ]]; then
+            echo "::error::main advanced to $main_sha while this release waited for approval"
+            exit 1
+          fi
+
+      - name: Revalidate registry state
+        id: registry
+        env:
+          PLANNED_VERSION: ${{ needs.plan.outputs.version }}
+          REQUESTED_VERSION: ${{ github.event.inputs.version }}
+          RESUME_RELEASE: ${{ needs.plan.outputs.resume }}
+        shell: bash
+        run: |
+          args=(
+            plan
+            --requested "$REQUESTED_VERSION"
+            --expect "$PLANNED_VERSION"
+            --github-output "$GITHUB_OUTPUT"
+          )
+          if [[ "$RESUME_RELEASE" == "true" ]]; then
+            args=(
+              plan
+              --requested "$PLANNED_VERSION"
+              --expect "$PLANNED_VERSION"
+              --allow-complete
+              --github-output "$GITHUB_OUTPUT"
+            )
+          fi
+          python3 scripts/release.py "${args[@]}"
+
+      - name: Set lockstep workspace version
+        run: python3 scripts/release.py set-version "${{ needs.plan.outputs.version }}"
+
+      - name: Recheck core crate package
+        if: steps.registry.outputs.core_published != 'true'
+        run: >-
+          cargo publish
+          --dry-run
+          --allow-dirty
+          --locked
+          -p featbit-server-sdk
+
+      - name: Commit release version
+        id: release_commit
+        env:
+          SOURCE_SHA: ${{ needs.plan.outputs.source_sha }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock integrations/opentelemetry/Cargo.toml
+          git diff --cached --check
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(release): v$VERSION [skip ci]"
+          fi
+
+          git fetch origin main
+          remote_main="$(git rev-parse origin/main)"
+          if [[ "$remote_main" != "$SOURCE_SHA" ]]; then
+            echo "::error::main advanced to $remote_main before the release commit"
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$remote_main" ]]; then
+            git push origin HEAD:main
+          fi
+          echo "release_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Authenticate with crates.io
+        id: auth
+        if: >-
+          steps.registry.outputs.core_published != 'true' ||
+          steps.registry.outputs.adapter_published != 'true'
+        uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+
+      - name: Publish core crate
+        if: steps.registry.outputs.core_published != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked -p featbit-server-sdk
+
+      - name: Wait for core crate index
+        if: steps.registry.outputs.adapter_published != 'true'
+        run: >-
+          python3 scripts/release.py wait
+          featbit-server-sdk
+          "${{ needs.plan.outputs.version }}"
+          --timeout 300
+          --interval 5
+
+      - name: Publish OpenTelemetry crate
+        if: steps.registry.outputs.adapter_published != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: cargo publish --locked -p featbit-server-sdk-opentelemetry
+
+      - name: Confirm both crates are indexed
+        run: |
+          python3 scripts/release.py wait \
+            featbit-server-sdk \
+            "${{ needs.plan.outputs.version }}" \
+            --timeout 300 \
+            --interval 5
+          python3 scripts/release.py wait \
+            featbit-server-sdk-opentelemetry \
+            "${{ needs.plan.outputs.version }}" \
+            --timeout 300 \
+            --interval 5
+
+      - name: Push release tag
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        shell: bash
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" > /dev/null; then
+            echo "::error::tag v$VERSION already exists"
+            exit 1
+          fi
+          git tag -a "v$VERSION" -m "Release v$VERSION"
+          git push origin "refs/tags/v$VERSION"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          IS_PRERELEASE: ${{ needs.plan.outputs.is_prerelease }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        shell: bash
+        run: |
+          args=(
+            release create "v$VERSION"
+            --verify-tag
+            --title "v$VERSION"
+            --generate-notes
+          )
+          if [[ "$IS_PRERELEASE" == "true" ]]; then
+            args+=(--prerelease)
+          fi
+          if ! gh "${args[@]}"; then
+            echo "::warning::crates and tag were published, but GitHub Release creation failed"
+            echo "GitHub Release creation needs to be completed manually for v$VERSION." \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Summarize release
+        env:
+          RELEASE_SHA: ${{ steps.release_commit.outputs.release_sha }}
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          {
+            echo "### Published v$VERSION"
+            echo
+            echo "- Commit: \`$RELEASE_SHA\`"
+            echo "- Core: https://crates.io/crates/featbit-server-sdk/$VERSION"
+            echo "- OpenTelemetry: https://crates.io/crates/featbit-server-sdk-opentelemetry/$VERSION"
+          } >> "$GITHUB_STEP_SUMMARY"

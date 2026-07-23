@@ -1,4 +1,5 @@
 /target/
+__pycache__/
+*.py[cod]
 *.profraw
 lcov.info
-
