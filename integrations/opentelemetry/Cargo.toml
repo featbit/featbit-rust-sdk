@@ -1,6 +1,6 @@
 [package]
 name = "featbit-server-sdk-opentelemetry"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 edition = "2021"
 rust-version = "1.95.0"
 authors = ["FeatBit"]
@@ -13,7 +13,7 @@ keywords = ["featbit", "feature-flags", "opentelemetry", "observability"]
 categories = ["api-bindings", "development-tools::debugging"]
 
 [dependencies]
-featbit-server-sdk = { path = "../..", version = "0.1.0-beta.1" }
+featbit-server-sdk = { path = "../..", version = "0.1.0-beta.2" }
 opentelemetry = { version = "0.32", default-features = false, features = ["logs", "trace"] }
 
 [lints.rust]

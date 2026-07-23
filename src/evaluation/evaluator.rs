@@ -4,7 +4,7 @@ use crate::store::DataSnapshot;
 
 use super::dispatch::{is_in_rollout, is_percentage_split};
 use super::segments::rule_matches_prepared;
-use super::{EvalError, EvalReason, EvalResult};
+use super::{EvalError, EvalResult, EvaluationReason};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Evaluator;
@@ -38,7 +38,7 @@ impl Evaluator {
         if !flag.is_enabled {
             let variation = Self::variation(flag, prepared, &flag.disabled_variation_id)
                 .ok_or(EvalError::MalformedFlag)?;
-            return Ok(Self::result(flag, variation, EvalReason::Off, false));
+            return Ok(Self::result(flag, variation, EvaluationReason::Off, false));
         }
 
         let target_variation = prepared
@@ -55,7 +55,7 @@ impl Evaluator {
             return Ok(Self::result(
                 flag,
                 variation,
-                EvalReason::TargetMatch,
+                EvaluationReason::TargetMatch,
                 flag.expt_include_all_targets,
             ));
         }
@@ -80,7 +80,7 @@ impl Evaluator {
             return Ok(Self::result(
                 flag,
                 variation,
-                EvalReason::RuleMatch {
+                EvaluationReason::RuleMatch {
                     name: rule.name.clone(),
                     split: is_percentage_split(&rule.variations),
                 },
@@ -102,7 +102,7 @@ impl Evaluator {
         Ok(Self::result(
             flag,
             variation,
-            EvalReason::Fallthrough {
+            EvaluationReason::Fallthrough {
                 split: is_percentage_split(&flag.fallthrough.variations),
             },
             send_to_experiment,
@@ -112,7 +112,7 @@ impl Evaluator {
     fn result(
         flag: &FeatureFlag,
         variation: &Variation,
-        reason: EvalReason,
+        reason: EvaluationReason,
         send_to_experiment: bool,
     ) -> EvalResult {
         EvalResult {

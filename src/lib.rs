@@ -1,8 +1,7 @@
-//! `FeatBit`'s server-side SDK and `OpenFeature` provider for Rust.
+//! `FeatBit`'s server-side SDK for Rust.
 //!
 //! The SDK keeps flag data synchronized in the background and evaluates flags locally. Create one
-//! [`FbClient`] or [`FeatBitProvider`] per `FeatBit` environment and reuse it for the lifetime of the
-//! application.
+//! [`FbClient`] per `FeatBit` environment and reuse it for the lifetime of the application.
 
 #![forbid(unsafe_code)]
 
@@ -13,7 +12,6 @@ mod evaluation;
 mod events;
 mod model;
 mod observation;
-mod open_feature;
 mod options;
 mod prepared;
 mod store;
@@ -21,15 +19,17 @@ mod store;
 mod test_support;
 mod worker;
 
-pub use client::{ClientStatus, EvaluationDetail, FbClient, ReasonKind};
+pub use client::{
+    ClientStatus, EvaluationDetail, EvaluationError, FbClient, RawEvaluation, ReasonKind,
+};
 pub use error::ConfigError;
+pub use evaluation::EvaluationReason;
 pub use events::FbEvaluationEvent;
 pub use model::{FbUser, FbUserBuilder};
 pub use observation::{
     EvaluationObservation, EvaluationObservationError, EvaluationObservationReason,
     EvaluationObserver,
 };
-pub use open_feature::FeatBitProvider;
 pub use options::{FbOptions, FbOptionsBuilder};
 
 /// The SDK name sent in network user-agent headers.

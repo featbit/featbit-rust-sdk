@@ -4,11 +4,11 @@
 
 | Field | Value |
 | --- | --- |
-| Last reviewed | 2026-07-22 |
+| Last reviewed | 2026-07-23 |
 | Rust baseline revision | `ea6b2a54d0c23a35c497500f114f6209038f0248`, plus the test changes recorded in this working tree |
 | .NET SDK revision | [`974e2a7a557095b300e4e89da86df7d6fa894963`](https://github.com/featbit/featbit-dotnet-sdk/commit/974e2a7a557095b300e4e89da86df7d6fa894963) |
 | .NET test source | [`tests/FeatBit.ServerSdk.Tests`](https://github.com/featbit/featbit-dotnet-sdk/tree/974e2a7a557095b300e4e89da86df7d6fa894963/tests/FeatBit.ServerSdk.Tests) |
-| Rust test inventory | 101 unit tests: 100 in the core SDK and 1 in the OpenTelemetry adapter |
+| Rust test inventory | 89 unit tests: 88 in the core SDK and 1 in the OpenTelemetry adapter; 14 OpenFeature conformance tests live in the separate provider repository |
 | .NET test inventory | 107 `[Fact]`/`[Theory]` methods, of which one is skipped |
 
 Raw test counts are not directly comparable. A Rust table-driven test can execute every row from
@@ -22,8 +22,12 @@ in the previous audit has a Rust test. Tests for .NET-only helper classes are in
 ported; equivalent Rust lifecycle behavior is tested through the SDK's public/component boundaries.
 
 The added Rust-specific coverage also verifies contracts that the .NET suite cannot cover:
-OpenFeature status, reason, error, context, and recursive struct mapping; immutable snapshot
-consistency; bounded worker shutdown; queue overflow behavior; and Rust-specific event metadata.
+immutable snapshot consistency; the protocol-neutral raw evaluation adapter boundary; bounded worker
+shutdown; queue overflow behavior; and Rust-specific event metadata.
+
+OpenFeature status, reason, error, context, and recursive struct mapping moved to
+[`openfeature-provider-rust-server`](https://github.com/featbit/openfeature-provider-rust-server)
+when the repositories were separated on 2026-07-23.
 
 ## Dispatch algorithm compatibility
 
@@ -112,11 +116,8 @@ condition user="10" operator=BiggerThan rule="9" expected=true actual=true
 
 The following requirements are covered in addition to .NET parity:
 
-- every OpenFeature provider status: `NotReady`, `Ready`, `Stale`, and terminal `Error`;
-- every OpenFeature evaluation reason: `Disabled`, `TargetingMatch`, `Split`, and `Default`;
-- `ProviderNotReady`, `FlagNotFound`, `TargetingKeyMissing`, `ParseError`, and `TypeMismatch`;
-- primitive, datetime, nested-object, and array context conversion, with unsupported/null handling;
-- all OpenFeature value types and recursive struct conversion;
+- raw evaluation flag/variation metadata, protocol reason, typed error, completion, and observation
+  behavior used by external adapters;
 - atomic flag-and-segment publication during concurrent evaluation;
 - online concurrent close with both WebSocket and event workers active;
 - HTTP batch splitting, automatic flushes, transport retry, caller timeout, request timeout, and
@@ -161,12 +162,13 @@ cargo +1.95.0 test --workspace --all-features
 cargo test --workspace --all-features evaluation -- --show-output
 ```
 
-The normal and MSRV runs each passed all 101 unit tests. The detailed evaluation run passed 26
-matching tests and displayed the cross-language fixture details described above.
+The normal and MSRV runs each passed all 89 tests in this repository. The separate provider's normal
+and MSRV runs each passed all 14 OpenFeature tests. The detailed evaluation run passed the matching
+tests and displayed the cross-language fixture details described above.
 
 ## Maintenance
 
 Update this report when the pinned .NET revision, rollout behavior, event wire shape, WebSocket
-protocol, OpenFeature dependency, Rust test inventory, or any matrix status changes. When a new gap
-is found, add the test first, then update this record. Document intentional protocol deviations in
-the repository engineering guide.
+protocol, raw adapter boundary, Rust test inventory, or any matrix status changes. When a new gap is
+found, add the test first, then update this record. Document intentional protocol deviations in the
+repository engineering guide.

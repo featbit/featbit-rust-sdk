@@ -30,12 +30,33 @@ impl fmt::Display for EvalError {
     }
 }
 
+/// Why `FeatBit` selected a variation before converting its string value.
+///
+/// This protocol-level reason is exposed by [`crate::RawEvaluation`]. Most applications should use
+/// the simpler [`crate::ReasonKind`] carried by typed detail methods.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum EvalReason {
+#[non_exhaustive]
+pub enum EvaluationReason {
+    /// The flag is disabled and selected its configured disabled variation.
     Off,
+    /// The user was directly targeted.
     TargetMatch,
-    RuleMatch { name: String, split: bool },
-    Fallthrough { split: bool },
+    /// A targeting rule matched.
+    ///
+    /// `split` is `true` when the rule selected among percentage rollout ranges.
+    RuleMatch {
+        /// The configured rule name.
+        name: String,
+        /// Whether the rule selected among percentage rollout ranges.
+        split: bool,
+    },
+    /// No target or rule matched, so the flag used its fallthrough rollout.
+    ///
+    /// `split` is `true` when the fallthrough selected among percentage rollout ranges.
+    Fallthrough {
+        /// Whether the fallthrough selected among percentage rollout ranges.
+        split: bool,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -43,6 +64,6 @@ pub(crate) struct EvalResult {
     pub(crate) flag_id: String,
     pub(crate) flag_type: String,
     pub(crate) variation: Variation,
-    pub(crate) reason: EvalReason,
+    pub(crate) reason: EvaluationReason,
     pub(crate) send_to_experiment: bool,
 }

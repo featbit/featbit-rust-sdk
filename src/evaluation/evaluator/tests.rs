@@ -5,7 +5,7 @@ use std::thread;
 use super::Evaluator;
 use crate::evaluation::dispatch::rollout_of_key;
 use crate::evaluation::test_support::{basic_flag, rollout};
-use crate::evaluation::{EvalError, EvalReason};
+use crate::evaluation::{EvalError, EvaluationReason};
 use crate::model::{
     Condition, DataSet, Fallthrough, FbUser, RolloutVariation, Segment, TargetRule, TargetUser,
 };
@@ -92,16 +92,19 @@ fn evaluation_order_is_off_target_rule_then_fallthrough() {
 
     let off_result = Evaluator::evaluate(&snapshot, "off", &user).expect("off should resolve");
     assert_eq!(off_result.variation.value, "false");
-    assert_eq!(off_result.reason, EvalReason::Off);
+    assert_eq!(off_result.reason, EvaluationReason::Off);
 
     let target_result =
         Evaluator::evaluate(&snapshot, "target", &user).expect("target should resolve");
     assert_eq!(target_result.variation.value, "false");
-    assert_eq!(target_result.reason, EvalReason::TargetMatch);
+    assert_eq!(target_result.reason, EvaluationReason::TargetMatch);
 
     let rule_result = Evaluator::evaluate(&snapshot, "rule", &user).expect("rule should resolve");
     assert_eq!(rule_result.variation.value, "false");
-    assert!(matches!(rule_result.reason, EvalReason::RuleMatch { .. }));
+    assert!(matches!(
+        rule_result.reason,
+        EvaluationReason::RuleMatch { .. }
+    ));
 }
 
 #[test]
@@ -150,7 +153,7 @@ fn rules_are_and_conditions_and_first_match_wins() {
     assert_eq!(result.variation.value, "false");
     assert!(matches!(
         result.reason,
-        EvalReason::RuleMatch { ref name, .. } if name == "complete"
+        EvaluationReason::RuleMatch { ref name, .. } if name == "complete"
     ));
 }
 
@@ -259,7 +262,7 @@ fn rollout_selection_uses_dotnet_default_and_custom_dispatch_keys() {
     assert_eq!(default_result.variation.id, "false");
     assert_eq!(
         default_result.reason,
-        EvalReason::Fallthrough { split: true }
+        EvaluationReason::Fallthrough { split: true }
     );
 
     let mut custom_key_flag = basic_flag("test-");
@@ -285,7 +288,7 @@ fn rollout_selection_uses_dotnet_default_and_custom_dispatch_keys() {
     assert_eq!(custom_result.variation.id, "true");
     assert_eq!(
         custom_result.reason,
-        EvalReason::Fallthrough { split: true }
+        EvaluationReason::Fallthrough { split: true }
     );
 }
 
@@ -450,7 +453,7 @@ fn concurrent_full_updates_never_mix_flags_and_segments() {
                     let result = Evaluator::evaluate(&snapshot, "consistent", &user)
                         .expect("each complete snapshot should evaluate");
                     assert_eq!(result.variation.value, "false");
-                    assert!(matches!(result.reason, EvalReason::RuleMatch { .. }));
+                    assert!(matches!(result.reason, EvaluationReason::RuleMatch { .. }));
                 }
             })
         })

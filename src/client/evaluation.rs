@@ -1,6 +1,6 @@
 use std::time::SystemTime;
 
-use crate::evaluation::{EvalError, EvalReason, EvalResult, Evaluator};
+use crate::evaluation::{EvalError, EvalResult, EvaluationReason, Evaluator};
 use crate::events::FbEvaluationEvent;
 use crate::model::FbUser;
 use crate::observation::{
@@ -8,6 +8,80 @@ use crate::observation::{
 };
 
 use super::{EvaluationDetail, FbClient, ReasonKind};
+
+/// A successful `FeatBit` evaluation before its string value is converted to an application type.
+///
+/// This advanced result is intended for adapters that must preserve `FeatBit` metadata and decide
+/// whether a converted value is valid before recording the evaluation. Calling
+/// [`FbClient::evaluate_raw`] does not emit an automatic evaluation event or a success observation;
+/// call [`FbClient::complete_raw_evaluation`] after conversion succeeds.
+#[derive(Clone, Debug)]
+pub struct RawEvaluation {
+    result: EvalResult,
+    event: FbEvaluationEvent,
+}
+
+impl RawEvaluation {
+    /// Returns the evaluated flag key.
+    #[must_use]
+    pub fn flag_key(&self) -> &str {
+        self.event.flag_key()
+    }
+
+    /// Returns the internal `FeatBit` flag ID.
+    #[must_use]
+    pub fn flag_id(&self) -> &str {
+        &self.result.flag_id
+    }
+
+    /// Returns the `FeatBit` variation type recorded with the flag.
+    #[must_use]
+    pub fn flag_type(&self) -> &str {
+        &self.result.flag_type
+    }
+
+    /// Returns the selected variation ID.
+    #[must_use]
+    pub fn variation_id(&self) -> &str {
+        &self.result.variation.id
+    }
+
+    /// Returns the selected variation's unconverted string value.
+    #[must_use]
+    pub fn value(&self) -> &str {
+        &self.result.variation.value
+    }
+
+    /// Returns why `FeatBit` selected the variation.
+    #[must_use]
+    pub const fn reason(&self) -> &EvaluationReason {
+        &self.result.reason
+    }
+
+    /// Returns the immutable event snapshot captured with this evaluation.
+    #[must_use]
+    pub const fn evaluation_event(&self) -> &FbEvaluationEvent {
+        &self.event
+    }
+}
+
+/// A typed failure returned by [`FbClient::evaluate_raw`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[non_exhaustive]
+pub enum EvaluationError {
+    /// The client has not initialized, is unavailable, or has closed.
+    #[error("client not ready")]
+    ClientNotReady,
+    /// The `FeatBit` user has no targeting key.
+    #[error("targeting key is missing")]
+    TargetingKeyMissing,
+    /// The requested flag does not exist or is archived.
+    #[error("flag not found")]
+    FlagNotFound,
+    /// Remote flag data cannot produce a valid variation.
+    #[error("malformed flag")]
+    MalformedFlag,
+}
 
 impl FbClient {
     /// Evaluates a boolean flag, returning `default` on every failure.
@@ -145,22 +219,22 @@ impl FbClient {
         converter: impl FnOnce(&str) -> Result<T, EvaluationObservationError>,
     ) -> EvaluationDetail<T> {
         match self.evaluate_raw(key, user) {
-            Ok((result, event)) => {
-                let (kind, reason) = reason_detail(&result.reason);
-                match converter(&result.variation.value) {
+            Ok(evaluation) => {
+                let (kind, reason) = reason_detail(evaluation.reason());
+                match converter(evaluation.value()) {
                     Ok(value) => {
-                        self.complete_evaluation(user, &result, &event);
+                        self.complete_raw_evaluation(user, &evaluation);
                         EvaluationDetail {
                             key: key.to_owned(),
                             kind,
                             reason,
                             value,
-                            variation_id: result.variation.id,
-                            evaluation_event: Some(event),
+                            variation_id: evaluation.result.variation.id,
+                            evaluation_event: Some(evaluation.event),
                         }
                     }
                     Err(error) => {
-                        self.observe_error(key, Some(user.key()), error);
+                        self.observe_evaluation_error(key, Some(user.key()), error);
                         let (kind, reason) = match error {
                             EvaluationObservationError::ParseError => {
                                 (ReasonKind::Error, "parse error")
@@ -173,44 +247,49 @@ impl FbClient {
             }
             Err(error) => {
                 let (kind, reason) = match error {
-                    ClientEvaluationError::NotReady => {
+                    EvaluationError::ClientNotReady => {
                         (ReasonKind::ClientNotReady, "client not ready")
                     }
-                    ClientEvaluationError::InvalidContext => {
+                    EvaluationError::TargetingKeyMissing => {
                         (ReasonKind::Error, "targeting key is missing")
                     }
-                    ClientEvaluationError::FlagNotFound => (ReasonKind::Error, "flag not found"),
-                    ClientEvaluationError::MalformedFlag => (ReasonKind::Error, "malformed flag"),
+                    EvaluationError::FlagNotFound => (ReasonKind::Error, "flag not found"),
+                    EvaluationError::MalformedFlag => (ReasonKind::Error, "malformed flag"),
                 };
                 EvaluationDetail::fallback(key, kind, reason, default)
             }
         }
     }
 
-    pub(crate) fn evaluate_raw(
-        &self,
-        key: &str,
-        user: &FbUser,
-    ) -> Result<(EvalResult, FbEvaluationEvent), ClientEvaluationError> {
+    /// Evaluates a flag without converting its string value or recording a successful evaluation.
+    ///
+    /// This advanced API lets an integration convert the result into its own type system before it
+    /// calls [`Self::complete_raw_evaluation`]. Evaluation is local and does not perform I/O. A
+    /// failure is reported to the configured evaluation observer before it is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed [`EvaluationError`] when the client cannot evaluate the flag.
+    pub fn evaluate_raw(&self, key: &str, user: &FbUser) -> Result<RawEvaluation, EvaluationError> {
         if !self.evaluation_available() {
-            self.observe_error(
+            self.observe_evaluation_error(
                 key,
                 (!user.key().is_empty()).then_some(user.key()),
                 EvaluationObservationError::ProviderNotReady,
             );
-            return Err(ClientEvaluationError::NotReady);
+            return Err(EvaluationError::ClientNotReady);
         }
         let snapshot = self.inner.store.load();
         let result = match Evaluator::evaluate(&snapshot, key, user) {
             Ok(result) => result,
             Err(error) => {
-                let client_error = ClientEvaluationError::from(error);
-                self.observe_error(
+                let evaluation_error = EvaluationError::from(error);
+                self.observe_evaluation_error(
                     key,
                     (!user.key().is_empty()).then_some(user.key()),
-                    observation_error(client_error),
+                    observation_error(evaluation_error),
                 );
-                return Err(client_error);
+                return Err(evaluation_error);
             }
         };
         let event = FbEvaluationEvent::new(
@@ -219,34 +298,41 @@ impl FbClient {
             &result.variation.value,
             result.send_to_experiment,
         );
-        Ok((result, event))
+        Ok(RawEvaluation { result, event })
     }
 
-    pub(crate) fn complete_evaluation(
-        &self,
-        user: &FbUser,
-        result: &EvalResult,
-        event: &FbEvaluationEvent,
-    ) {
+    /// Records a successful raw evaluation after an integration has converted its value.
+    ///
+    /// This applies the same automatic analytics and observer behavior as a successful typed
+    /// variation method. Call it at most once for a raw result; repeated calls can enqueue duplicate
+    /// analytics events.
+    pub fn complete_raw_evaluation(&self, user: &FbUser, evaluation: &RawEvaluation) {
         if !self.inner.options.disable_events {
-            let _accepted = self.inner.event_processor.record_evaluation(user, event);
+            let _accepted = self
+                .inner
+                .event_processor
+                .record_evaluation(user, &evaluation.event);
         }
         let Some(observer) = &self.inner.options.evaluation_observer else {
             return;
         };
         let observation = EvaluationObservation::success(
-            event.timestamp(),
-            event.flag_key(),
+            evaluation.event.timestamp(),
+            evaluation.event.flag_key(),
             user.key(),
-            event.variation_id(),
-            event.variation_value(),
-            observation_reason(&result.reason),
-            event.send_to_experiment(),
+            evaluation.event.variation_id(),
+            evaluation.event.variation_value(),
+            observation_reason(&evaluation.result.reason),
+            evaluation.event.send_to_experiment(),
         );
         observer.on_evaluation(&observation);
     }
 
-    pub(crate) fn observe_error(
+    /// Reports an integration-side evaluation failure to the configured observer.
+    ///
+    /// This method performs no analytics tracking and is a no-op when no observer is configured.
+    /// `context_key` should be omitted when conversion failed before a valid user was available.
+    pub fn observe_evaluation_error(
         &self,
         key: &str,
         context_key: Option<&str>,
@@ -260,18 +346,10 @@ impl FbClient {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ClientEvaluationError {
-    NotReady,
-    InvalidContext,
-    FlagNotFound,
-    MalformedFlag,
-}
-
-impl From<EvalError> for ClientEvaluationError {
+impl From<EvalError> for EvaluationError {
     fn from(error: EvalError) -> Self {
         match error {
-            EvalError::InvalidContext => Self::InvalidContext,
+            EvalError::InvalidContext => Self::TargetingKeyMissing,
             EvalError::FlagNotFound => Self::FlagNotFound,
             EvalError::MalformedFlag => Self::MalformedFlag,
         }
@@ -290,34 +368,35 @@ fn string_detail_from_result(key: &str, result: EvalResult) -> EvaluationDetail<
     }
 }
 
-fn observation_reason(reason: &EvalReason) -> EvaluationObservationReason {
+fn observation_reason(reason: &EvaluationReason) -> EvaluationObservationReason {
     match reason {
-        EvalReason::Off => EvaluationObservationReason::Disabled,
-        EvalReason::TargetMatch | EvalReason::RuleMatch { split: false, .. } => {
+        EvaluationReason::Off => EvaluationObservationReason::Disabled,
+        EvaluationReason::TargetMatch | EvaluationReason::RuleMatch { split: false, .. } => {
             EvaluationObservationReason::TargetingMatch
         }
-        EvalReason::RuleMatch { split: true, .. } | EvalReason::Fallthrough { split: true } => {
-            EvaluationObservationReason::Split
-        }
-        EvalReason::Fallthrough { split: false } => EvaluationObservationReason::Default,
+        EvaluationReason::RuleMatch { split: true, .. }
+        | EvaluationReason::Fallthrough { split: true } => EvaluationObservationReason::Split,
+        EvaluationReason::Fallthrough { split: false } => EvaluationObservationReason::Default,
     }
 }
 
-fn observation_error(error: ClientEvaluationError) -> EvaluationObservationError {
+fn observation_error(error: EvaluationError) -> EvaluationObservationError {
     match error {
-        ClientEvaluationError::NotReady => EvaluationObservationError::ProviderNotReady,
-        ClientEvaluationError::InvalidContext => EvaluationObservationError::TargetingKeyMissing,
-        ClientEvaluationError::FlagNotFound => EvaluationObservationError::FlagNotFound,
-        ClientEvaluationError::MalformedFlag => EvaluationObservationError::ParseError,
+        EvaluationError::ClientNotReady => EvaluationObservationError::ProviderNotReady,
+        EvaluationError::TargetingKeyMissing => EvaluationObservationError::TargetingKeyMissing,
+        EvaluationError::FlagNotFound => EvaluationObservationError::FlagNotFound,
+        EvaluationError::MalformedFlag => EvaluationObservationError::ParseError,
     }
 }
 
-fn reason_detail(reason: &EvalReason) -> (ReasonKind, String) {
+fn reason_detail(reason: &EvaluationReason) -> (ReasonKind, String) {
     match reason {
-        EvalReason::Off => (ReasonKind::Off, "flag off".to_owned()),
-        EvalReason::TargetMatch => (ReasonKind::TargetMatch, "target match".to_owned()),
-        EvalReason::RuleMatch { name, .. } => (ReasonKind::RuleMatch, format!("match rule {name}")),
-        EvalReason::Fallthrough { .. } => (
+        EvaluationReason::Off => (ReasonKind::Off, "flag off".to_owned()),
+        EvaluationReason::TargetMatch => (ReasonKind::TargetMatch, "target match".to_owned()),
+        EvaluationReason::RuleMatch { name, .. } => {
+            (ReasonKind::RuleMatch, format!("match rule {name}"))
+        }
+        EvaluationReason::Fallthrough { .. } => (
             ReasonKind::Fallthrough,
             "fall through targets and rules".to_owned(),
         ),
@@ -339,7 +418,7 @@ mod tests {
     use serde_json::json;
 
     use super::FbClient;
-    use crate::{ClientStatus, FbOptions, FbUser, ReasonKind};
+    use crate::{ClientStatus, EvaluationError, EvaluationReason, FbOptions, FbUser, ReasonKind};
 
     const TYPED_BOOTSTRAP: &str = r#"{
         "messageType":"data-sync",
@@ -448,5 +527,50 @@ mod tests {
         assert_eq!(detail.value, "fallback");
         assert_eq!(detail.kind, ReasonKind::Error);
         assert_eq!(detail.reason, "flag not found");
+    }
+
+    #[test]
+    fn raw_evaluation_exposes_protocol_neutral_adapter_metadata() {
+        let client = typed_client();
+        let user = FbUser::builder("u1").build();
+
+        let evaluation = client
+            .evaluate_raw("bool", &user)
+            .expect("known flag should evaluate");
+        assert_eq!(evaluation.flag_key(), "bool");
+        assert_eq!(evaluation.flag_id(), "bool-id");
+        assert_eq!(evaluation.flag_type(), "boolean");
+        assert_eq!(evaluation.variation_id(), "bool-value");
+        assert_eq!(evaluation.value(), "TRUE");
+        assert_eq!(
+            evaluation.reason(),
+            &EvaluationReason::Fallthrough { split: false }
+        );
+        assert_eq!(evaluation.evaluation_event().flag_key(), "bool");
+        assert_eq!(evaluation.evaluation_event().variation_id(), "bool-value");
+
+        client.complete_raw_evaluation(&user, &evaluation);
+    }
+
+    #[test]
+    fn raw_evaluation_returns_stable_typed_errors() {
+        let client = typed_client();
+        let user = FbUser::builder("u1").build();
+        let empty_user = FbUser::builder("").build();
+
+        assert!(matches!(
+            client.evaluate_raw("bool", &empty_user),
+            Err(EvaluationError::TargetingKeyMissing)
+        ));
+        assert!(matches!(
+            client.evaluate_raw("missing", &user),
+            Err(EvaluationError::FlagNotFound)
+        ));
+
+        client.close();
+        assert!(matches!(
+            client.evaluate_raw("bool", &user),
+            Err(EvaluationError::ClientNotReady)
+        ));
     }
 }
