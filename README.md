@@ -14,10 +14,6 @@ OpenFeature support lives in the separate
 [FeatBit OpenFeature Provider for Rust](https://github.com/featbit/openfeature-provider-rust-server)
 repository.
 
-When upgrading from `0.1.0-beta.1`, replace the core crate's `FeatBitProvider` import and
-`open-feature` dependency with `featbit-openfeature-provider`. Direct `FbClient` APIs remain in this
-repository.
-
 ## Data Synchronization
 
 The SDK keeps feature flags and segments synchronized over WebSocket and evaluates them from an
