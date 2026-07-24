@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
 
@@ -10,7 +9,7 @@ use crate::model::{
     Condition, DataSet, Fallthrough, FbUser, RolloutVariation, Segment, TargetRule, TargetUser,
 };
 use crate::prepared::IS_IN_SEGMENT;
-use crate::store::{DataSnapshot, SnapshotStore};
+use crate::store::{test_snapshot_map, DataSnapshot, SnapshotStore};
 
 #[test]
 fn missing_archived_invalid_context_and_malformed_flags_return_typed_errors() {
@@ -23,10 +22,11 @@ fn missing_archived_invalid_context_and_malformed_flags_return_typed_errors() {
     let mut malformed_fallthrough = basic_flag("malformed-fallthrough");
     malformed_fallthrough.fallthrough.variations.clear();
     let snapshot = DataSnapshot {
-        flags: [archived, malformed_off, malformed_fallthrough]
-            .into_iter()
-            .map(|flag| (flag.key.clone(), Arc::new(flag)))
-            .collect(),
+        flags: test_snapshot_map(
+            [archived, malformed_off, malformed_fallthrough]
+                .into_iter()
+                .map(|flag| (flag.key.clone(), Arc::new(flag))),
+        ),
         populated: true,
         ..DataSnapshot::default()
     };
@@ -57,7 +57,7 @@ fn missing_archived_invalid_context_and_malformed_flags_return_typed_errors() {
 fn successful_result_borrows_flag_and_variation_from_the_snapshot() {
     let flag = basic_flag("borrowed");
     let snapshot = DataSnapshot {
-        flags: [(flag.key.clone(), Arc::new(flag))].into(),
+        flags: test_snapshot_map([(flag.key.clone(), Arc::new(flag))]),
         ..DataSnapshot::default()
     };
     let stored_flag = snapshot
@@ -109,10 +109,11 @@ fn evaluation_order_is_off_target_rule_then_fallthrough() {
     });
 
     let snapshot = DataSnapshot {
-        flags: [off, target, rule]
-            .into_iter()
-            .map(|flag| (flag.key.clone(), Arc::new(flag)))
-            .collect::<HashMap<_, _>>(),
+        flags: test_snapshot_map(
+            [off, target, rule]
+                .into_iter()
+                .map(|flag| (flag.key.clone(), Arc::new(flag))),
+        ),
         populated: true,
         ..DataSnapshot::default()
     };
@@ -168,7 +169,7 @@ fn rules_are_and_conditions_and_first_match_wins() {
         },
     ];
     let snapshot = DataSnapshot {
-        flags: [(flag.key.clone(), Arc::new(flag))].into(),
+        flags: test_snapshot_map([(flag.key.clone(), Arc::new(flag))]),
         populated: true,
         ..DataSnapshot::default()
     };
@@ -221,10 +222,11 @@ fn experiment_delivery_matches_dotnet_target_rule_and_fallthrough_semantics() {
     };
 
     let snapshot = DataSnapshot {
-        flags: [targeted, rule, fallthrough]
-            .into_iter()
-            .map(|flag| (flag.key.clone(), Arc::new(flag)))
-            .collect(),
+        flags: test_snapshot_map(
+            [targeted, rule, fallthrough]
+                .into_iter()
+                .map(|flag| (flag.key.clone(), Arc::new(flag))),
+        ),
         populated: true,
         ..DataSnapshot::default()
     };
@@ -267,7 +269,7 @@ fn rollout_selection_uses_dotnet_default_and_custom_dispatch_keys() {
     let mut default_key_flag = basic_flag("test-");
     default_key_flag.fallthrough.variations = variations.clone();
     let default_snapshot = DataSnapshot {
-        flags: [(default_key_flag.key.clone(), Arc::new(default_key_flag))].into(),
+        flags: test_snapshot_map([(default_key_flag.key.clone(), Arc::new(default_key_flag))]),
         populated: true,
         ..DataSnapshot::default()
     };
@@ -293,7 +295,7 @@ fn rollout_selection_uses_dotnet_default_and_custom_dispatch_keys() {
     custom_key_flag.fallthrough.dispatch_key = Some("bucket".to_owned());
     custom_key_flag.fallthrough.variations = variations;
     let custom_snapshot = DataSnapshot {
-        flags: [(custom_key_flag.key.clone(), Arc::new(custom_key_flag))].into(),
+        flags: test_snapshot_map([(custom_key_flag.key.clone(), Arc::new(custom_key_flag))]),
         populated: true,
         ..DataSnapshot::default()
     };
@@ -328,7 +330,7 @@ fn experiment_sampling_uses_expt_prefixed_dispatch_key() {
     }];
 
     let snapshot = |flag| DataSnapshot {
-        flags: [("test-".to_owned(), Arc::new(flag))].into(),
+        flags: test_snapshot_map([("test-".to_owned(), Arc::new(flag))]),
         populated: true,
         ..DataSnapshot::default()
     };
@@ -401,8 +403,8 @@ fn preprocessed_snapshot_preserves_rule_and_segment_results() {
     });
 
     let raw = DataSnapshot {
-        flags: [(flag.key.clone(), Arc::new(flag.clone()))].into(),
-        segments: [(segment.id.clone(), Arc::new(segment.clone()))].into(),
+        flags: test_snapshot_map([(flag.key.clone(), Arc::new(flag.clone()))]),
+        segments: test_snapshot_map([(segment.id.clone(), Arc::new(segment.clone()))]),
         populated: true,
         ..DataSnapshot::default()
     };

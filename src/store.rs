@@ -9,8 +9,8 @@ use crate::prepared::{PreparedFlag, PreparedSegment, PreparedSnapshot};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DataSnapshot {
-    pub(crate) flags: HashMap<String, Arc<FeatureFlag>>,
-    pub(crate) segments: HashMap<String, Arc<Segment>>,
+    pub(crate) flags: Arc<HashMap<Arc<str>, Arc<FeatureFlag>>>,
+    pub(crate) segments: Arc<HashMap<Arc<str>, Arc<Segment>>>,
     pub(crate) prepared: PreparedSnapshot,
     pub(crate) version: i64,
     pub(crate) populated: bool,
@@ -27,6 +27,18 @@ pub(crate) enum PatchResult {
     Changed,
     Unchanged,
     VersionConflict,
+}
+
+#[cfg(test)]
+pub(crate) fn test_snapshot_map<T>(
+    entries: impl IntoIterator<Item = (String, Arc<T>)>,
+) -> Arc<HashMap<Arc<str>, Arc<T>>> {
+    Arc::new(
+        entries
+            .into_iter()
+            .map(|(key, value)| (Arc::from(key), value))
+            .collect(),
+    )
 }
 
 impl SnapshotStore {
@@ -46,10 +58,8 @@ impl SnapshotStore {
         let _write_guard = self.write_lock.lock();
         let mut flags = HashMap::with_capacity(data.feature_flags.len());
         let mut segments = HashMap::with_capacity(data.segments.len());
-        let mut prepared = PreparedSnapshot {
-            flags: HashMap::with_capacity(data.feature_flags.len()),
-            segments: HashMap::with_capacity(data.segments.len()),
-        };
+        let mut prepared_flags = HashMap::with_capacity(data.feature_flags.len());
+        let mut prepared_segments = HashMap::with_capacity(data.segments.len());
         let mut version = 0;
 
         for flag in &data.feature_flags {
@@ -57,26 +67,27 @@ impl SnapshotStore {
                 continue;
             }
             version = version.max(flag.updated_at);
-            prepared
-                .flags
-                .insert(flag.key.clone(), Arc::new(PreparedFlag::new(flag)));
-            flags.insert(flag.key.clone(), Arc::new(flag.clone()));
+            let key: Arc<str> = Arc::from(flag.key.as_str());
+            prepared_flags.insert(Arc::clone(&key), Arc::new(PreparedFlag::new(flag)));
+            flags.insert(key, Arc::new(flag.clone()));
         }
         for segment in &data.segments {
             if segment.id.is_empty() {
                 continue;
             }
             version = version.max(segment.updated_at);
-            prepared
-                .segments
-                .insert(segment.id.clone(), Arc::new(PreparedSegment::new(segment)));
-            segments.insert(segment.id.clone(), Arc::new(segment.clone()));
+            let id: Arc<str> = Arc::from(segment.id.as_str());
+            prepared_segments.insert(Arc::clone(&id), Arc::new(PreparedSegment::new(segment)));
+            segments.insert(id, Arc::new(segment.clone()));
         }
 
         self.snapshot.store(Arc::new(DataSnapshot {
-            flags,
-            segments,
-            prepared,
+            flags: Arc::new(flags),
+            segments: Arc::new(segments),
+            prepared: PreparedSnapshot {
+                flags: Arc::new(prepared_flags),
+                segments: Arc::new(prepared_segments),
+            },
             version,
             populated: true,
         }));
@@ -85,8 +96,8 @@ impl SnapshotStore {
     pub(crate) fn patch(&self, data: &DataSet) -> PatchResult {
         let _write_guard = self.write_lock.lock();
         let current = self.load();
-        let mut flags = current.flags.clone();
-        let mut segments = current.segments.clone();
+        let mut flags = Arc::clone(&current.flags);
+        let mut segments = Arc::clone(&current.segments);
         let mut prepared = current.prepared.clone();
         let mut changed = false;
         let mut version_conflict = false;
@@ -95,7 +106,7 @@ impl SnapshotStore {
             if flag.key.is_empty() {
                 continue;
             }
-            let should_replace = match flags.get(&flag.key) {
+            let should_replace = match flags.get(flag.key.as_str()) {
                 None => true,
                 Some(existing) if existing.updated_at < flag.updated_at => true,
                 Some(existing)
@@ -107,10 +118,10 @@ impl SnapshotStore {
                 Some(_) => false,
             };
             if should_replace {
-                prepared
-                    .flags
-                    .insert(flag.key.clone(), Arc::new(PreparedFlag::new(flag)));
-                flags.insert(flag.key.clone(), Arc::new(flag.clone()));
+                let key: Arc<str> = Arc::from(flag.key.as_str());
+                Arc::make_mut(&mut prepared.flags)
+                    .insert(Arc::clone(&key), Arc::new(PreparedFlag::new(flag)));
+                Arc::make_mut(&mut flags).insert(key, Arc::new(flag.clone()));
                 changed = true;
             }
         }
@@ -118,7 +129,7 @@ impl SnapshotStore {
             if segment.id.is_empty() {
                 continue;
             }
-            let should_replace = match segments.get(&segment.id) {
+            let should_replace = match segments.get(segment.id.as_str()) {
                 None => true,
                 Some(existing) if existing.updated_at < segment.updated_at => true,
                 Some(existing)
@@ -131,10 +142,10 @@ impl SnapshotStore {
                 Some(_) => false,
             };
             if should_replace {
-                prepared
-                    .segments
-                    .insert(segment.id.clone(), Arc::new(PreparedSegment::new(segment)));
-                segments.insert(segment.id.clone(), Arc::new(segment.clone()));
+                let id: Arc<str> = Arc::from(segment.id.as_str());
+                Arc::make_mut(&mut prepared.segments)
+                    .insert(Arc::clone(&id), Arc::new(PreparedSegment::new(segment)));
+                Arc::make_mut(&mut segments).insert(id, Arc::new(segment.clone()));
                 changed = true;
             }
         }

@@ -210,7 +210,7 @@ impl FbClient {
             .flags
             .iter()
             .filter(|(_, flag)| !flag.is_archived)
-            .map(|(key, _)| key.as_str())
+            .map(|(key, _)| key.as_ref())
             .collect();
         keys.sort_unstable();
         keys.into_iter()
