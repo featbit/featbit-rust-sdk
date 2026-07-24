@@ -27,6 +27,15 @@ pub(crate) struct WebSocketDataSynchronizer {
     status: Arc<StatusTracker>,
     close_timeout: Duration,
     closed: AtomicBool,
+    close_complete: AtomicBool,
+}
+
+struct SyncWorkerStatusOnExit(Arc<StatusTracker>);
+
+impl Drop for SyncWorkerStatusOnExit {
+    fn drop(&mut self) {
+        self.0.set(SyncStatus::Closed);
+    }
 }
 
 impl WebSocketDataSynchronizer {
@@ -39,6 +48,7 @@ impl WebSocketDataSynchronizer {
         let worker_status = Arc::clone(&status);
         let close_timeout = options.close_timeout;
         let worker = WorkerThread::spawn("data synchronizer", move || {
+            let _status_on_exit = SyncWorkerStatusOnExit(Arc::clone(&worker_status));
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build();
@@ -63,6 +73,7 @@ impl WebSocketDataSynchronizer {
                 status,
                 close_timeout,
                 closed: AtomicBool::new(false),
+                close_complete: AtomicBool::new(false),
             }),
             Err(error) => {
                 log::error!("failed to start FeatBit WebSocket worker: {error}");
@@ -74,7 +85,10 @@ impl WebSocketDataSynchronizer {
 
     pub(crate) fn close(&self) {
         if self.closed.swap(true, Ordering::AcqRel) {
-            let _ignored = self.worker.wait(Duration::ZERO);
+            if !self.close_complete.load(Ordering::Acquire) {
+                let _ignored = self.worker.wait(self.close_timeout);
+                self.status.set(SyncStatus::Closed);
+            }
             return;
         }
         let _ignored = self.stop.send(true);
@@ -88,6 +102,7 @@ impl WebSocketDataSynchronizer {
             }
         }
         self.status.set(SyncStatus::Closed);
+        self.close_complete.store(true, Ordering::Release);
     }
 }
 

@@ -215,9 +215,11 @@ impl FbClient {
     /// This is available when the `allow_track` argument to
     /// [`FbOptionsBuilder::disable_events`] is `true`. It returns `false` when explicit tracking is
     /// not allowed, the client is not operational, the event is invalid, or the bounded queue is
-    /// full. Use the event carried by a detail variation result to preserve the exact variation and
-    /// experiment decision selected at evaluation time. Calling this while automatic evaluation
-    /// events are enabled records a second event for the same evaluation.
+    /// full. A retained event does not require the current flag snapshot, so it can be queued while
+    /// initial data synchronization is still pending. Use the event carried by a detail variation
+    /// result to preserve the exact variation and experiment decision selected at evaluation time.
+    /// Calling this while automatic evaluation events are enabled records a second event for the
+    /// same evaluation.
     #[must_use]
     pub fn track_eval_event(&self, user: &FbUser, event: &FbEvaluationEvent) -> bool {
         self.tracking_available() && self.inner.event_processor.record_evaluation(user, event)
@@ -232,7 +234,7 @@ impl FbClient {
     /// events are enabled records an additional event.
     #[must_use]
     pub fn track_eval_event_for_flag(&self, user: &FbUser, flag_key: &str) -> bool {
-        if !self.tracking_available() {
+        if !self.tracking_available() || !self.evaluation_available() {
             return false;
         }
         let snapshot = self.inner.store.load();
@@ -253,7 +255,8 @@ impl FbClient {
     /// This is available when the `allow_track` argument to
     /// [`FbOptionsBuilder::disable_events`] is `true`. It returns `false` when explicit tracking is
     /// not allowed, the client is not operational, the event is invalid, or the bounded queue is
-    /// full.
+    /// full. Metric tracking does not require an initialized flag snapshot and remains available
+    /// while initial data synchronization is pending.
     #[must_use]
     pub fn track_metric_event(&self, user: &FbUser, event_name: &str, numeric_value: f64) -> bool {
         self.tracking_available()
@@ -280,7 +283,9 @@ impl FbClient {
 
     /// Stops synchronization and performs a bounded final event flush.
     ///
-    /// Calling this more than once is safe. All future variation calls return their fallback.
+    /// Calling this more than once, including concurrently, is safe. Every caller waits for the
+    /// shared workers up to the configured close and flush timeouts. All future variation calls
+    /// return their fallback.
     pub fn close(&self) {
         self.inner.close();
     }
@@ -295,7 +300,10 @@ impl FbClient {
     }
 
     fn tracking_available(&self) -> bool {
-        self.inner.options.allow_track && self.evaluation_available()
+        self.inner.options.allow_track
+            && !self.inner.closed.load(Ordering::Acquire)
+            && self.inner.status.status() != SyncStatus::Closed
+            && self.inner.event_processor.is_accepting()
     }
 }
 

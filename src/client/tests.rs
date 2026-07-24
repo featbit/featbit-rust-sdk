@@ -99,6 +99,62 @@ fn uninitialized_client_returns_fallback_without_panicking() {
 }
 
 #[test]
+fn explicit_tracking_remains_available_while_initial_sync_is_pending() {
+    let (event_url, bodies, server) = scripted_http_server([202]);
+    let options = FbOptionsBuilder::new("valid-secret")
+        .streaming_url("ws://127.0.0.1:9")
+        .event_url(event_url)
+        .start_wait(Duration::from_millis(2))
+        .connect_timeout(Duration::from_millis(1))
+        .close_timeout(Duration::from_millis(200))
+        .auto_flush_interval(Duration::from_mins(1))
+        .disable_events(true, true)
+        .build()
+        .expect("options should build");
+    let client = FbClient::with_options(options);
+    let user = FbUser::builder("pending-sync-user").build();
+    let event = FbEvaluationEvent::new("known-result", "variation", "value", false);
+
+    assert_eq!(client.status(), ClientStatus::NotReady);
+    assert!(client.track_eval_event(&user, &event));
+    assert!(client.track_metric_event(&user, "before-initial-sync", 1.0));
+    assert!(
+        !client.track_eval_event_for_flag(&user, "unknown"),
+        "re-evaluation still requires an initialized snapshot"
+    );
+    client.inner.status.set(SyncStatus::Closed);
+    assert!(
+        !client.track_metric_event(&user, "after-terminal-sync-failure", 1.0),
+        "terminal clients must reject new tracking"
+    );
+    assert!(client.flush_and_wait(Duration::from_secs(2)));
+    client.close();
+    server.join().expect("event server should stop");
+
+    let body = bodies
+        .recv_timeout(Duration::from_secs(1))
+        .expect("explicit events should be delivered");
+    let events =
+        serde_json::from_slice::<serde_json::Value>(&body).expect("event batch should be JSON");
+    let events = events.as_array().expect("event batch should be an array");
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.get("variations").is_some())
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.get("metrics").is_some())
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn evaluation_and_idempotent_close_are_thread_safe() {
     let options = FbOptionsBuilder::new("valid-secret")
         .offline(true)

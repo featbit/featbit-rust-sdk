@@ -693,6 +693,7 @@ fn full_queue_and_stalled_http_request_do_not_block_concurrent_close() {
 
     assert!(started.elapsed() < Duration::from_secs(2));
     assert!(inner.closed.load(Ordering::Acquire));
+    assert!(inner.close_complete.load(Ordering::Acquire));
     assert!(inner.sender.load_full().is_none());
     assert_eq!(
         inner.worker.wait(Duration::from_secs(1)),
@@ -701,6 +702,74 @@ fn full_queue_and_stalled_http_request_do_not_block_concurrent_close() {
 
     let _ignored = server_stop_sender.send(());
     server.join().expect("test server should stop");
+}
+
+#[test]
+fn additional_close_waits_for_an_in_progress_event_worker() {
+    let (release_sender, release_receiver) = bounded(1);
+    let worker = WorkerThread::spawn("test-event-close-worker", move || {
+        let _released = release_receiver.recv();
+    })
+    .expect("test worker should start");
+    let (sender, _receiver) = bounded(1);
+    let (shutdown_sender, _shutdown_receiver) = bounded(2);
+    let (abort_sender, _abort_receiver) = watch::channel(false);
+    let inner = Arc::new(EventProcessorInner {
+        sender: ArcSwapOption::from(Some(Arc::new(sender))),
+        shutdown_sender,
+        abort_sender,
+        closed: AtomicBool::new(true),
+        close_complete: AtomicBool::new(false),
+        capacity_exceeded: AtomicBool::new(false),
+        capacity: Arc::new(EventCapacity::new(1, 1_024)),
+        delivery_stopped: Arc::new(AtomicBool::new(false)),
+        worker,
+        flush_timeout: Duration::from_secs(1),
+    });
+    let (entered_sender, entered_receiver) = bounded(1);
+    let (completed_sender, completed_receiver) = bounded(1);
+    let closing = Arc::clone(&inner);
+    let closer = thread::spawn(move || {
+        entered_sender
+            .send(())
+            .expect("test should observe close entry");
+        closing.close();
+        completed_sender
+            .send(())
+            .expect("test should observe close completion");
+    });
+
+    entered_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("close thread should start");
+    assert!(
+        completed_receiver
+            .recv_timeout(Duration::from_millis(50))
+            .is_err(),
+        "a concurrent close must not return while the shared worker is still running"
+    );
+    release_sender
+        .send(())
+        .expect("test worker should be released");
+    completed_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("close should finish after the worker");
+    closer.join().expect("close thread should not panic");
+    assert_eq!(inner.worker.wait(Duration::ZERO), WorkerWait::Completed);
+}
+
+#[test]
+fn abnormal_event_worker_exit_stops_new_event_admission() {
+    let delivery_stopped = Arc::new(AtomicBool::new(false));
+    let worker_delivery_stopped = Arc::clone(&delivery_stopped);
+    let worker = WorkerThread::spawn("test-panicking-event-worker", move || {
+        let _stopped_on_exit = EventWorkerStoppedOnExit(worker_delivery_stopped);
+        panic!("simulated event worker failure");
+    })
+    .expect("test worker should start");
+
+    assert_eq!(worker.wait(Duration::from_secs(1)), WorkerWait::Panicked);
+    assert!(delivery_stopped.load(Ordering::Acquire));
 }
 
 #[test]

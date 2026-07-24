@@ -30,6 +30,14 @@ use worker::{event_endpoint, is_recoverable};
 
 const MAX_PUBLIC_WAIT: Duration = Duration::from_hours(8_760);
 
+struct EventWorkerStoppedOnExit(Arc<AtomicBool>);
+
+impl Drop for EventWorkerStoppedOnExit {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum EventProcessor {
     Disabled,
@@ -53,14 +61,17 @@ impl EventProcessor {
         let worker_delivery_stopped = Arc::clone(&delivery_stopped);
         let worker_config = EventWorkerConfig::from_options(options);
         let worker = WorkerThread::spawn("event processor", move || {
+            let _stopped_on_exit = EventWorkerStoppedOnExit(Arc::clone(&worker_delivery_stopped));
             let runtime = RuntimeBuilder::new_current_thread().enable_all().build();
             match runtime {
-                Ok(runtime) => EventWorker::new(worker_config, worker_delivery_stopped).run(
-                    &runtime,
-                    &receiver,
-                    &shutdown_receiver,
-                    abort_receiver,
-                ),
+                Ok(runtime) => {
+                    EventWorker::new(worker_config, Arc::clone(&worker_delivery_stopped)).run(
+                        &runtime,
+                        &receiver,
+                        &shutdown_receiver,
+                        abort_receiver,
+                    );
+                }
                 Err(error) => {
                     worker_delivery_stopped.store(true, Ordering::Release);
                     log::error!("failed to start FeatBit event runtime: {error}");
@@ -74,6 +85,7 @@ impl EventProcessor {
                 shutdown_sender,
                 abort_sender,
                 closed: AtomicBool::new(false),
+                close_complete: AtomicBool::new(false),
                 capacity_exceeded: AtomicBool::new(false),
                 capacity,
                 delivery_stopped,
@@ -261,6 +273,7 @@ pub(crate) struct EventProcessorInner {
     shutdown_sender: Sender<Shutdown>,
     abort_sender: watch::Sender<bool>,
     closed: AtomicBool,
+    close_complete: AtomicBool,
     capacity_exceeded: AtomicBool,
     capacity: Arc<EventCapacity>,
     delivery_stopped: Arc<AtomicBool>,
@@ -271,7 +284,9 @@ pub(crate) struct EventProcessorInner {
 impl EventProcessorInner {
     fn close(&self) {
         if self.closed.swap(true, Ordering::AcqRel) {
-            let _ignored = self.worker.wait(Duration::ZERO);
+            if !self.close_complete.load(Ordering::Acquire) {
+                let _ignored = self.worker.wait(self.flush_timeout.min(MAX_PUBLIC_WAIT));
+            }
             return;
         }
 
@@ -283,29 +298,31 @@ impl EventProcessorInner {
         let _ignored = self.shutdown_sender.try_send(Shutdown::Graceful);
 
         match self.worker.wait(graceful_budget) {
-            WorkerWait::Completed => return,
-            WorkerWait::Panicked => {
-                log::warn!("FeatBit event processor stopped after a worker panic");
-                return;
-            }
-            WorkerWait::TimedOut => {}
-        }
-
-        let _ignored = self.abort_sender.send(true);
-        let _ignored = self.shutdown_sender.try_send(Shutdown::Abort);
-        match self.worker.wait(abort_budget) {
-            WorkerWait::Completed => {
-                log::warn!(
-                    "FeatBit event processor exceeded its graceful flush budget and was cancelled"
-                );
-            }
+            WorkerWait::Completed => {}
             WorkerWait::Panicked => {
                 log::warn!("FeatBit event processor stopped after a worker panic");
             }
             WorkerWait::TimedOut => {
-                log::warn!("FeatBit event processor did not close within the configured timeout");
+                let _ignored = self.abort_sender.send(true);
+                let _ignored = self.shutdown_sender.try_send(Shutdown::Abort);
+                match self.worker.wait(abort_budget) {
+                    WorkerWait::Completed => {
+                        log::warn!(
+                            "FeatBit event processor exceeded its graceful flush budget and was cancelled"
+                        );
+                    }
+                    WorkerWait::Panicked => {
+                        log::warn!("FeatBit event processor stopped after a worker panic");
+                    }
+                    WorkerWait::TimedOut => {
+                        log::warn!(
+                            "FeatBit event processor did not close within the configured timeout"
+                        );
+                    }
+                }
             }
         }
+        self.close_complete.store(true, Ordering::Release);
     }
 }
 
