@@ -59,11 +59,33 @@ pub enum EvaluationReason {
     },
 }
 
-#[derive(Clone, Debug)]
-pub(crate) struct EvalResult {
-    pub(crate) flag_id: String,
-    pub(crate) flag_type: String,
-    pub(crate) variation: Variation,
-    pub(crate) reason: EvaluationReason,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum EvalReason<'a> {
+    Off,
+    TargetMatch,
+    RuleMatch { name: &'a str, split: bool },
+    Fallthrough { split: bool },
+}
+
+impl EvalReason<'_> {
+    pub(crate) fn into_owned(self) -> EvaluationReason {
+        match self {
+            Self::Off => EvaluationReason::Off,
+            Self::TargetMatch => EvaluationReason::TargetMatch,
+            Self::RuleMatch { name, split } => EvaluationReason::RuleMatch {
+                name: name.to_owned(),
+                split,
+            },
+            Self::Fallthrough { split } => EvaluationReason::Fallthrough { split },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct EvalResult<'a> {
+    pub(crate) flag_id: &'a str,
+    pub(crate) flag_type: &'a str,
+    pub(crate) variation: &'a Variation,
+    pub(crate) reason: EvalReason<'a>,
     pub(crate) send_to_experiment: bool,
 }

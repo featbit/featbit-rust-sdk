@@ -33,11 +33,27 @@ impl FbEvaluationEvent {
         variation_value: impl Into<String>,
         send_to_experiment: bool,
     ) -> Self {
+        Self::at(
+            flag_key,
+            variation_id,
+            variation_value,
+            SystemTime::now(),
+            send_to_experiment,
+        )
+    }
+
+    pub(crate) fn at(
+        flag_key: impl Into<String>,
+        variation_id: impl Into<String>,
+        variation_value: impl Into<String>,
+        timestamp: SystemTime,
+        send_to_experiment: bool,
+    ) -> Self {
         Self {
             flag_key: flag_key.into(),
             variation_id: variation_id.into(),
             variation_value: variation_value.into(),
-            timestamp: SystemTime::now(),
+            timestamp,
             send_to_experiment,
         }
     }
@@ -94,17 +110,36 @@ pub(super) enum PayloadEvent {
 }
 
 impl PayloadEvent {
+    #[cfg(test)]
     pub(super) fn evaluation(user: &FbUser, event: &FbEvaluationEvent) -> Self {
+        Self::evaluation_at(
+            user,
+            event.flag_key(),
+            event.variation_id(),
+            event.variation_value(),
+            event.timestamp(),
+            event.send_to_experiment(),
+        )
+    }
+
+    pub(super) fn evaluation_at(
+        user: &FbUser,
+        flag_key: &str,
+        variation_id: &str,
+        variation_value: &str,
+        timestamp: SystemTime,
+        send_to_experiment: bool,
+    ) -> Self {
         Self::Evaluation(EvaluationPayload {
             user: EventUser::from(user),
             variations: vec![EvaluationVariation {
-                feature_flag_key: event.flag_key.clone(),
+                feature_flag_key: flag_key.to_owned(),
                 variation: EventVariation {
-                    id: event.variation_id.clone(),
-                    value: event.variation_value.clone(),
+                    id: variation_id.to_owned(),
+                    value: variation_value.to_owned(),
                 },
-                timestamp: unix_millis(event.timestamp),
-                send_to_experiment: event.send_to_experiment,
+                timestamp: unix_millis(timestamp),
+                send_to_experiment,
             }],
         })
     }

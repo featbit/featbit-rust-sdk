@@ -51,3 +51,7 @@ unsafe_code = "forbid"
 [lints.clippy]
 all = "warn"
 pedantic = "warn"
+
+[[bench]]
+name = "evaluation_hot_path"
+harness = false

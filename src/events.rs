@@ -6,7 +6,7 @@ mod tests;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use arc_swap::ArcSwapOption;
 use crossbeam_channel::{bounded, Sender, TrySendError};
@@ -82,14 +82,40 @@ impl EventProcessor {
     }
 
     pub(crate) fn record_evaluation(&self, user: &FbUser, event: &FbEvaluationEvent) -> bool {
-        if user.key().is_empty()
-            || event.flag_key().trim().is_empty()
-            || event.variation_id().trim().is_empty()
-        {
+        self.record_evaluation_at(
+            user,
+            event.flag_key(),
+            event.variation_id(),
+            event.variation_value(),
+            event.timestamp(),
+            event.send_to_experiment(),
+        )
+    }
+
+    pub(crate) fn record_evaluation_at(
+        &self,
+        user: &FbUser,
+        flag_key: &str,
+        variation_id: &str,
+        variation_value: &str,
+        timestamp: SystemTime,
+        send_to_experiment: bool,
+    ) -> bool {
+        if user.key().is_empty() || flag_key.trim().is_empty() || variation_id.trim().is_empty() {
             log::debug!("discarding invalid FeatBit evaluation event");
             return false;
         }
-        self.record(PayloadEvent::evaluation(user, event))
+        if !self.is_accepting() {
+            return false;
+        }
+        self.record(PayloadEvent::evaluation_at(
+            user,
+            flag_key,
+            variation_id,
+            variation_value,
+            timestamp,
+            send_to_experiment,
+        ))
     }
 
     pub(crate) fn record_metric(
@@ -131,6 +157,13 @@ impl EventProcessor {
             }
             Err(TrySendError::Disconnected(_)) => false,
         }
+    }
+
+    pub(crate) fn is_accepting(&self) -> bool {
+        let Self::Active(inner) = self else {
+            return false;
+        };
+        !inner.closed.load(Ordering::Acquire) && !inner.delivery_stopped.load(Ordering::Acquire)
     }
 
     pub(crate) fn flush(&self) {

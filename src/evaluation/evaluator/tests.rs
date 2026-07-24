@@ -5,7 +5,7 @@ use std::thread;
 use super::Evaluator;
 use crate::evaluation::dispatch::rollout_of_key;
 use crate::evaluation::test_support::{basic_flag, rollout};
-use crate::evaluation::{EvalError, EvaluationReason};
+use crate::evaluation::{EvalError, EvalReason};
 use crate::model::{
     Condition, DataSet, Fallthrough, FbUser, RolloutVariation, Segment, TargetRule, TargetUser,
 };
@@ -54,6 +54,33 @@ fn missing_archived_invalid_context_and_malformed_flags_return_typed_errors() {
 }
 
 #[test]
+fn successful_result_borrows_flag_and_variation_from_the_snapshot() {
+    let flag = basic_flag("borrowed");
+    let snapshot = DataSnapshot {
+        flags: [(flag.key.clone(), Arc::new(flag))].into(),
+        ..DataSnapshot::default()
+    };
+    let stored_flag = snapshot
+        .flags
+        .get("borrowed")
+        .expect("stored flag should remain available");
+    let stored_variation = stored_flag
+        .variations
+        .first()
+        .expect("basic flag should contain a variation");
+    let user = FbUser::builder("user").build();
+
+    let result = Evaluator::evaluate(&snapshot, "borrowed", &user).expect("flag should evaluate");
+
+    assert!(std::ptr::eq(result.flag_id, stored_flag.id.as_str()));
+    assert!(std::ptr::eq(
+        result.flag_type,
+        stored_flag.variation_type.as_str()
+    ));
+    assert!(std::ptr::eq(result.variation, stored_variation));
+}
+
+#[test]
 fn evaluation_order_is_off_target_rule_then_fallthrough() {
     let user = FbUser::builder("user-1").custom("tier", "pro").build();
     let mut off = basic_flag("off");
@@ -92,19 +119,16 @@ fn evaluation_order_is_off_target_rule_then_fallthrough() {
 
     let off_result = Evaluator::evaluate(&snapshot, "off", &user).expect("off should resolve");
     assert_eq!(off_result.variation.value, "false");
-    assert_eq!(off_result.reason, EvaluationReason::Off);
+    assert_eq!(off_result.reason, EvalReason::Off);
 
     let target_result =
         Evaluator::evaluate(&snapshot, "target", &user).expect("target should resolve");
     assert_eq!(target_result.variation.value, "false");
-    assert_eq!(target_result.reason, EvaluationReason::TargetMatch);
+    assert_eq!(target_result.reason, EvalReason::TargetMatch);
 
     let rule_result = Evaluator::evaluate(&snapshot, "rule", &user).expect("rule should resolve");
     assert_eq!(rule_result.variation.value, "false");
-    assert!(matches!(
-        rule_result.reason,
-        EvaluationReason::RuleMatch { .. }
-    ));
+    assert!(matches!(rule_result.reason, EvalReason::RuleMatch { .. }));
 }
 
 #[test]
@@ -153,7 +177,7 @@ fn rules_are_and_conditions_and_first_match_wins() {
     assert_eq!(result.variation.value, "false");
     assert!(matches!(
         result.reason,
-        EvaluationReason::RuleMatch { ref name, .. } if name == "complete"
+        EvalReason::RuleMatch { name, .. } if name == "complete"
     ));
 }
 
@@ -262,7 +286,7 @@ fn rollout_selection_uses_dotnet_default_and_custom_dispatch_keys() {
     assert_eq!(default_result.variation.id, "false");
     assert_eq!(
         default_result.reason,
-        EvaluationReason::Fallthrough { split: true }
+        EvalReason::Fallthrough { split: true }
     );
 
     let mut custom_key_flag = basic_flag("test-");
@@ -288,7 +312,7 @@ fn rollout_selection_uses_dotnet_default_and_custom_dispatch_keys() {
     assert_eq!(custom_result.variation.id, "true");
     assert_eq!(
         custom_result.reason,
-        EvaluationReason::Fallthrough { split: true }
+        EvalReason::Fallthrough { split: true }
     );
 }
 
@@ -309,7 +333,8 @@ fn experiment_sampling_uses_expt_prefixed_dispatch_key() {
         ..DataSnapshot::default()
     };
     let prefixed_rollout = rollout_of_key("expttest-value");
-    let excluded = Evaluator::evaluate(&snapshot(flag.clone()), "test-", &user)
+    let excluded_snapshot = snapshot(flag.clone());
+    let excluded = Evaluator::evaluate(&excluded_snapshot, "test-", &user)
         .expect("fallthrough should resolve");
     println!(
         "evaluation experiment_dispatch_key=\"expttest-value\" rollout={prefixed_rollout:.17} experiment_upper=0.50000000000000000 send_to_experiment={}",
@@ -323,7 +348,8 @@ fn experiment_sampling_uses_expt_prefixed_dispatch_key() {
 
     let mut included_flag = flag;
     included_flag.fallthrough.variations[0].expt_rollout = 0.6;
-    let included = Evaluator::evaluate(&snapshot(included_flag), "test-", &user)
+    let included_snapshot = snapshot(included_flag);
+    let included = Evaluator::evaluate(&included_snapshot, "test-", &user)
         .expect("fallthrough should resolve");
     println!(
         "evaluation experiment_dispatch_key=\"expttest-value\" rollout={prefixed_rollout:.17} experiment_upper=0.60000000000000000 send_to_experiment={}",
@@ -453,7 +479,7 @@ fn concurrent_full_updates_never_mix_flags_and_segments() {
                     let result = Evaluator::evaluate(&snapshot, "consistent", &user)
                         .expect("each complete snapshot should evaluate");
                     assert_eq!(result.variation.value, "false");
-                    assert!(matches!(result.reason, EvaluationReason::RuleMatch { .. }));
+                    assert!(matches!(result.reason, EvalReason::RuleMatch { .. }));
                 }
             })
         })

@@ -264,8 +264,8 @@ fn retained_evaluation_event_survives_a_newer_flag_snapshot() {
 #[test]
 fn event_modes_control_automatic_and_explicit_delivery() {
     for (disable, allow_track, expected_evaluations, expected_metrics) in [
-        (false, true, 2, 1),
-        (false, false, 1, 0),
+        (false, true, 3, 1),
+        (false, false, 2, 0),
         (true, true, 1, 1),
         (true, false, 0, 0),
     ] {
@@ -296,6 +296,7 @@ fn event_modes_control_automatic_and_explicit_delivery() {
 
         let user = FbUser::builder("user").build();
         let detail = client.bool_variation_detail("enabled", &user, false);
+        assert!(client.bool_variation("enabled", &user, false));
         let evaluation_event = detail
             .evaluation_event
             .as_ref()
@@ -360,6 +361,7 @@ fn observer_is_independent_from_featbit_event_delivery() {
 
     let detail = client.bool_variation_detail("enabled", &user, false);
     assert!(detail.value);
+    assert!(client.bool_variation("enabled", &user, false));
     assert!(!client.track_metric_event(&user, "disabled", 1.0));
     assert!(!client.track_eval_event(
         &user,
@@ -377,18 +379,23 @@ fn observer_is_independent_from_featbit_event_delivery() {
     let observations = observations
         .lock()
         .expect("test observer lock should remain available");
-    assert_eq!(observations.len(), 3);
+    assert_eq!(observations.len(), 4);
     assert_eq!(
         observations[0].reason(),
         EvaluationObservationReason::Default
     );
     assert_eq!(observations[0].variation_id(), Some("value"));
     assert_eq!(
-        observations[1].error_type(),
+        observations[1].reason(),
+        EvaluationObservationReason::Default
+    );
+    assert_eq!(observations[1].variation_id(), Some("value"));
+    assert_eq!(
+        observations[2].error_type(),
         Some(EvaluationObservationError::FlagNotFound)
     );
     assert_eq!(
-        observations[2].error_type(),
+        observations[3].error_type(),
         Some(EvaluationObservationError::TypeMismatch)
     );
     assert!(!format!("{:?}", observations[0]).contains("private-user-key"));
