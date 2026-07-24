@@ -2,7 +2,7 @@ use crate::model::{FbUser, FeatureFlag, RolloutVariation, Variation};
 use crate::prepared::PreparedFlag;
 use crate::store::DataSnapshot;
 
-use super::dispatch::{is_in_rollout, is_percentage_split};
+use super::dispatch::{is_in_rollout, is_percentage_split, RolloutMatcher};
 use super::segments::rule_matches_prepared;
 use super::{EvalError, EvalReason, EvalResult};
 
@@ -146,9 +146,10 @@ impl Evaluator {
         rollouts: &'a [RolloutVariation],
         dispatch_key: &str,
     ) -> Option<&'a RolloutVariation> {
+        let mut matcher = RolloutMatcher::new(dispatch_key);
         rollouts
             .iter()
-            .find(|rollout| is_in_rollout(dispatch_key, &rollout.rollout))
+            .find(|rollout| matcher.matches(&rollout.rollout))
     }
 
     fn should_send_to_experiment(
