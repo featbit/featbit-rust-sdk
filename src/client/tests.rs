@@ -42,6 +42,8 @@ const READY_BOOTSTRAP: &str = r#"{
         }],"segments":[]}
     }"#;
 
+const DOCUMENTED_BOOTSTRAP: &str = include_str!("../../examples/featbit-bootstrap.json");
+
 const UPDATED_BOOTSTRAP: &str = r#"{
         "messageType":"data-sync",
         "data":{"eventType":"full","featureFlags":[{
@@ -80,6 +82,23 @@ const ALL_VARIATIONS_BOOTSTRAP: &str = r#"{
 fn public_client_is_send_and_sync() {
     const fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<FbClient>();
+}
+
+#[test]
+fn documented_offline_bootstrap_evaluates_without_network() {
+    let options = FbOptionsBuilder::new("offline-placeholder")
+        .offline(true)
+        .disable_events(true, false)
+        .bootstrap_json(DOCUMENTED_BOOTSTRAP)
+        .build()
+        .expect("documented bootstrap should build");
+    let client = FbClient::with_options(options);
+    let user = FbUser::builder("offline-example-user").build();
+
+    assert_eq!(client.status(), ClientStatus::Ready);
+    assert!(client.bool_variation("offline-example", &user, false));
+
+    client.close();
 }
 
 #[test]

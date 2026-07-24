@@ -244,8 +244,35 @@ it after the application has drained in-flight work.
 
 ### Offline Mode
 
-Offline mode performs no network I/O. An optional FeatBit full data-sync envelope can initialize
-the local snapshot:
+Offline mode performs no network I/O and sends no analytics. Without bootstrap data, no feature
+flags or segments are available and evaluations return their caller-provided fallbacks.
+
+Do not construct a production bootstrap file by hand because the FeatBit data-sync format is
+protocol-owned and may evolve. Download the current flags and segments for an environment directly
+from its Evaluation Server or FeatBit Agent:
+
+```console
+curl --fail --show-error \
+  --header "Authorization: <your-environment-secret>" \
+  "<evaluation-server-or-agent-url>/api/public/sdk/server/latest-all" \
+  --output featbit-bootstrap.json
+```
+
+For a direct Evaluation Server connection, use the HTTP(S) base URL also supplied to `event_url`,
+such as `http://localhost:5100` for local development. The `Authorization` value is the FeatBit
+environment secret, not a REST API access token. See
+[Retrieve feature flags with API](https://docs.featbit.co/sdk/retrieve-feature-flags-with-api#server-side)
+for the server-side endpoint contract.
+
+The response is a full data-sync envelope with `messageType = "data-sync"` and
+`data.eventType = "full"`. Make the initial request without a `timestamp` query parameter because
+incremental responses are not valid bootstrap documents. See
+[`examples/featbit-bootstrap.json`](examples/featbit-bootstrap.json) for a synthetic,
+non-production example. A downloaded snapshot contains flag configuration, targeting rules, and
+segments: treat it as sensitive configuration, do not commit a production snapshot, and refresh it
+whenever the environment changes.
+
+Use the downloaded file to initialize the local snapshot:
 
 ```rust,no_run
 use featbit_server_sdk::{FbClient, FbOptions};
@@ -264,7 +291,8 @@ let client = FbClient::with_options(options);
 ```
 
 Bootstrap JSON is accepted only in offline mode so static data cannot compete with the live
-synchronizer. An empty offline store is operational; unknown flags resolve to fallbacks.
+synchronizer. The SDK validates that the document is a full data-sync envelope. Offline mode does
+not poll for updates; unknown flags continue to resolve to fallbacks.
 
 ### Disable Events Collection
 

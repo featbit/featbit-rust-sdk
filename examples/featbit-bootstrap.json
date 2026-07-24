@@ -1,0 +1,44 @@
+{
+  "messageType": "data-sync",
+  "data": {
+    "eventType": "full",
+    "featureFlags": [
+      {
+        "id": "offline-example-flag-id",
+        "key": "offline-example",
+        "updatedAt": 1,
+        "variationType": "boolean",
+        "variations": [
+          {
+            "id": "offline-enabled",
+            "value": "true"
+          },
+          {
+            "id": "offline-disabled",
+            "value": "false"
+          }
+        ],
+        "targetUsers": [],
+        "rules": [],
+        "isEnabled": true,
+        "disabledVariationId": "offline-disabled",
+        "fallthrough": {
+          "includedInExpt": false,
+          "variations": [
+            {
+              "id": "offline-enabled",
+              "rollout": [
+                0,
+                1
+              ],
+              "exptRollout": 0
+            }
+          ]
+        },
+        "exptIncludeAllTargets": false,
+        "isArchived": false
+      }
+    ],
+    "segments": []
+  }
+}
