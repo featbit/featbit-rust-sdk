@@ -29,7 +29,17 @@ access.
 
 ### Installation
 
-Add the current SDK version and a logger implementation to `Cargo.toml`:
+The latest stable SDK is available on
+[crates.io](https://crates.io/crates/featbit-server-sdk). Add it and a logger implementation with
+Cargo:
+
+```console
+cargo add featbit-server-sdk
+cargo add env_logger
+```
+
+These commands update `Cargo.toml`. To pin this release exactly, use
+`cargo add featbit-server-sdk@=0.1.1`. The equivalent manual configuration is:
 
 ```toml
 [dependencies]
