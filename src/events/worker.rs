@@ -11,8 +11,7 @@ use url::Url;
 use crate::options::FbOptions;
 use crate::user_agent;
 
-use super::payload::PayloadEvent;
-use super::{EventMessage, Shutdown};
+use super::{EventMessage, PendingEvent, Shutdown};
 
 #[derive(Clone, Debug)]
 pub(super) struct EventWorkerConfig {
@@ -42,7 +41,7 @@ impl EventWorkerConfig {
 pub(super) struct EventWorker {
     config: EventWorkerConfig,
     client: Option<Client>,
-    buffer: Vec<PayloadEvent>,
+    buffer: Vec<PendingEvent>,
     delivery_stopped: bool,
     shared_delivery_stopped: Arc<AtomicBool>,
     unreported_delivery_failure: bool,
@@ -145,7 +144,8 @@ impl EventWorker {
         abort: &mut watch::Receiver<bool>,
     ) -> bool {
         match message {
-            EventMessage::Payload(event) => {
+            EventMessage::Payload(mut event) => {
+                event.mark_dequeued();
                 if !self.delivery_stopped {
                     self.buffer.push(event);
                     if self.buffer.len() >= self.config.max_events_per_request {

@@ -1,4 +1,5 @@
 use std::fmt;
+use std::mem::size_of;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
@@ -110,6 +111,27 @@ pub(super) enum PayloadEvent {
 }
 
 impl PayloadEvent {
+    pub(super) fn estimated_evaluation_size(
+        user: &FbUser,
+        flag_key: &str,
+        variation_id: &str,
+        variation_value: &str,
+    ) -> usize {
+        estimated_user_size(user)
+            .saturating_add(size_of::<PayloadEvent>())
+            .saturating_add(size_of::<EvaluationVariation>())
+            .saturating_add(flag_key.len())
+            .saturating_add(variation_id.len())
+            .saturating_add(variation_value.len())
+    }
+
+    pub(super) fn estimated_metric_size(user: &FbUser, event_name: &str) -> usize {
+        estimated_user_size(user)
+            .saturating_add(size_of::<PayloadEvent>())
+            .saturating_add(size_of::<Metric>())
+            .saturating_add(event_name.len())
+    }
+
     #[cfg(test)]
     pub(super) fn evaluation(user: &FbUser, event: &FbEvaluationEvent) -> Self {
         Self::evaluation_at(
@@ -157,6 +179,88 @@ impl PayloadEvent {
             }],
         })
     }
+
+    #[cfg(test)]
+    pub(super) fn retained_size(&self) -> usize {
+        match self {
+            Self::Evaluation(payload) => retained_user_size(&payload.user)
+                .saturating_add(size_of::<PayloadEvent>())
+                .saturating_add(
+                    payload
+                        .variations
+                        .capacity()
+                        .saturating_mul(size_of::<EvaluationVariation>()),
+                )
+                .saturating_add(
+                    payload
+                        .variations
+                        .iter()
+                        .map(|variation| {
+                            variation
+                                .feature_flag_key
+                                .capacity()
+                                .saturating_add(variation.variation.id.capacity())
+                                .saturating_add(variation.variation.value.capacity())
+                        })
+                        .fold(0, usize::saturating_add),
+                ),
+            Self::Metric(payload) => retained_user_size(&payload.user)
+                .saturating_add(size_of::<PayloadEvent>())
+                .saturating_add(
+                    payload
+                        .metrics
+                        .capacity()
+                        .saturating_mul(size_of::<Metric>()),
+                )
+                .saturating_add(
+                    payload
+                        .metrics
+                        .iter()
+                        .map(|metric| metric.event_name.capacity())
+                        .fold(0, usize::saturating_add),
+                ),
+        }
+    }
+}
+
+fn estimated_user_size(user: &FbUser) -> usize {
+    user.key()
+        .len()
+        .saturating_add(user.name().len())
+        .saturating_add(
+            user.custom()
+                .len()
+                .saturating_mul(size_of::<CustomizedProperty>()),
+        )
+        .saturating_add(
+            user.custom()
+                .iter()
+                .map(|(name, value)| name.len().saturating_add(value.len()))
+                .fold(0, usize::saturating_add),
+        )
+}
+
+#[cfg(test)]
+fn retained_user_size(user: &EventUser) -> usize {
+    user.key_id
+        .capacity()
+        .saturating_add(user.name.capacity())
+        .saturating_add(
+            user.customized_properties
+                .capacity()
+                .saturating_mul(size_of::<CustomizedProperty>()),
+        )
+        .saturating_add(
+            user.customized_properties
+                .iter()
+                .map(|property| {
+                    property
+                        .name
+                        .capacity()
+                        .saturating_add(property.value.capacity())
+                })
+                .fold(0, usize::saturating_add),
+        )
 }
 
 fn unix_millis(timestamp: SystemTime) -> i64 {

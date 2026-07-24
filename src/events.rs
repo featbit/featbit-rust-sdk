@@ -4,7 +4,8 @@ mod worker;
 #[cfg(test)]
 mod tests;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::mem::size_of;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -45,6 +46,10 @@ impl EventProcessor {
         let (shutdown_sender, shutdown_receiver) = bounded(2);
         let (abort_sender, abort_receiver) = watch::channel(false);
         let delivery_stopped = Arc::new(AtomicBool::new(false));
+        let capacity = Arc::new(EventCapacity::new(
+            options.max_events_in_queue,
+            options.max_event_queue_size_bytes,
+        ));
         let worker_delivery_stopped = Arc::clone(&delivery_stopped);
         let worker_config = EventWorkerConfig::from_options(options);
         let worker = WorkerThread::spawn("event processor", move || {
@@ -70,6 +75,7 @@ impl EventProcessor {
                 abort_sender,
                 closed: AtomicBool::new(false),
                 capacity_exceeded: AtomicBool::new(false),
+                capacity,
                 delivery_stopped,
                 worker,
                 flush_timeout: options.flush_timeout,
@@ -108,14 +114,19 @@ impl EventProcessor {
         if !self.is_accepting() {
             return false;
         }
-        self.record(PayloadEvent::evaluation_at(
-            user,
-            flag_key,
-            variation_id,
-            variation_value,
-            timestamp,
-            send_to_experiment,
-        ))
+        let retained_bytes =
+            PayloadEvent::estimated_evaluation_size(user, flag_key, variation_id, variation_value)
+                .saturating_add(size_of::<EventAdmission>());
+        self.record(retained_bytes, || {
+            PayloadEvent::evaluation_at(
+                user,
+                flag_key,
+                variation_id,
+                variation_value,
+                timestamp,
+                send_to_experiment,
+            )
+        })
     }
 
     pub(crate) fn record_metric(
@@ -128,10 +139,17 @@ impl EventProcessor {
             log::debug!("discarding invalid FeatBit metric event");
             return false;
         }
-        self.record(PayloadEvent::metric(user, event_name, numeric_value))
+        if !self.is_accepting() {
+            return false;
+        }
+        let retained_bytes = PayloadEvent::estimated_metric_size(user, event_name)
+            .saturating_add(size_of::<EventAdmission>());
+        self.record(retained_bytes, || {
+            PayloadEvent::metric(user, event_name, numeric_value)
+        })
     }
 
-    fn record(&self, event: PayloadEvent) -> bool {
+    fn record(&self, retained_bytes: usize, create_event: impl FnOnce() -> PayloadEvent) -> bool {
         let Self::Active(inner) = self else {
             return false;
         };
@@ -142,17 +160,25 @@ impl EventProcessor {
         let Some(sender) = inner.sender.load_full() else {
             return false;
         };
+        if sender.is_full() {
+            log_event_queue_overflow(&inner.capacity_exceeded);
+            return false;
+        }
+        let Some(admission) = inner.capacity.try_reserve(retained_bytes) else {
+            log_event_queue_overflow(&inner.capacity_exceeded);
+            return false;
+        };
+        let event = PendingEvent {
+            payload: create_event(),
+            admission,
+        };
         match sender.try_send(EventMessage::Payload(event)) {
             Ok(()) => {
                 mark_event_queue_available(&inner.capacity_exceeded);
                 true
             }
             Err(TrySendError::Full(_)) => {
-                if should_log_event_queue_overflow(&inner.capacity_exceeded) {
-                    log::warn!(
-                        "FeatBit events are being produced faster than they can be processed; events will be dropped"
-                    );
-                }
+                log_event_queue_overflow(&inner.capacity_exceeded);
                 false
             }
             Err(TrySendError::Disconnected(_)) => false,
@@ -221,6 +247,14 @@ fn should_log_event_queue_overflow(capacity_exceeded: &AtomicBool) -> bool {
     !capacity_exceeded.swap(true, Ordering::AcqRel)
 }
 
+fn log_event_queue_overflow(capacity_exceeded: &AtomicBool) {
+    if should_log_event_queue_overflow(capacity_exceeded) {
+        log::warn!(
+            "FeatBit event capacity is exhausted; events will be dropped until capacity recovers"
+        );
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct EventProcessorInner {
     sender: ArcSwapOption<Sender<EventMessage>>,
@@ -228,6 +262,7 @@ pub(crate) struct EventProcessorInner {
     abort_sender: watch::Sender<bool>,
     closed: AtomicBool,
     capacity_exceeded: AtomicBool,
+    capacity: Arc<EventCapacity>,
     delivery_stopped: Arc<AtomicBool>,
     worker: WorkerThread,
     flush_timeout: Duration,
@@ -282,8 +317,113 @@ impl Drop for EventProcessorInner {
 
 #[derive(Debug)]
 enum EventMessage {
-    Payload(PayloadEvent),
+    Payload(PendingEvent),
     Flush(Option<Sender<bool>>),
+}
+
+#[derive(Debug)]
+struct PendingEvent {
+    payload: PayloadEvent,
+    admission: EventAdmission,
+}
+
+impl PendingEvent {
+    fn mark_dequeued(&mut self) {
+        self.admission.mark_dequeued();
+    }
+}
+
+impl serde::Serialize for PendingEvent {
+    fn serialize<Serializer>(
+        &self,
+        serializer: Serializer,
+    ) -> Result<Serializer::Ok, Serializer::Error>
+    where
+        Serializer: serde::Serializer,
+    {
+        serde::Serialize::serialize(&self.payload, serializer)
+    }
+}
+
+#[derive(Debug)]
+struct EventCapacity {
+    max_queued_events: usize,
+    max_retained_bytes: usize,
+    queued_events: AtomicUsize,
+    retained_bytes: AtomicUsize,
+}
+
+impl EventCapacity {
+    const fn new(max_queued_events: usize, max_retained_bytes: usize) -> Self {
+        Self {
+            max_queued_events,
+            max_retained_bytes,
+            queued_events: AtomicUsize::new(0),
+            retained_bytes: AtomicUsize::new(0),
+        }
+    }
+
+    fn try_reserve(self: &Arc<Self>, retained_bytes: usize) -> Option<EventAdmission> {
+        if !try_reserve_counter(&self.queued_events, 1, self.max_queued_events) {
+            return None;
+        }
+        if !try_reserve_counter(
+            &self.retained_bytes,
+            retained_bytes,
+            self.max_retained_bytes,
+        ) {
+            self.queued_events.fetch_sub(1, Ordering::Relaxed);
+            return None;
+        }
+        Some(EventAdmission {
+            capacity: Arc::clone(self),
+            retained_bytes,
+            occupies_queue_slot: true,
+        })
+    }
+}
+
+fn try_reserve_counter(counter: &AtomicUsize, amount: usize, maximum: usize) -> bool {
+    let mut current = counter.load(Ordering::Relaxed);
+    loop {
+        let Some(next) = current.checked_add(amount) else {
+            return false;
+        };
+        if next > maximum {
+            return false;
+        }
+        match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct EventAdmission {
+    capacity: Arc<EventCapacity>,
+    retained_bytes: usize,
+    occupies_queue_slot: bool,
+}
+
+impl EventAdmission {
+    fn mark_dequeued(&mut self) {
+        if self.occupies_queue_slot {
+            self.occupies_queue_slot = false;
+            self.capacity.queued_events.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
+impl Drop for EventAdmission {
+    fn drop(&mut self) {
+        if self.occupies_queue_slot {
+            self.capacity.queued_events.fetch_sub(1, Ordering::Relaxed);
+        }
+        self.capacity
+            .retained_bytes
+            .fetch_sub(self.retained_bytes, Ordering::Relaxed);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
