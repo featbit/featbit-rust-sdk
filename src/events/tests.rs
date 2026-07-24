@@ -836,13 +836,18 @@ fn connection_level_delivery_failure_retries_the_unchanged_batch() {
     let options = crate::options::FbOptionsBuilder::new("valid-secret")
         .event_url(event_url)
         .auto_flush_interval(Duration::from_mins(1))
+        .event_request_timeout(Duration::from_secs(5))
         .max_send_event_attempts(2)
         .send_event_retry_interval(Duration::from_millis(1))
         .build()
         .expect("options should build");
     let processor = EventProcessor::new(&options);
+    let large_json = format!(r#"{{"payload":"{}"}}"#, "x".repeat(512 * 1024));
 
-    assert!(processor.record_metric(&test_user(), "transport-retry", 7.0));
+    assert!(processor.record_evaluation(
+        &test_user(),
+        &FbEvaluationEvent::new("transport-retry", "variation-id", &large_json, false)
+    ));
     assert!(processor.flush_and_wait(Duration::from_secs(2)));
     processor.close();
     server.join().expect("event server should stop");
@@ -854,4 +859,9 @@ fn connection_level_delivery_failure_retries_the_unchanged_batch() {
         .recv_timeout(Duration::from_secs(1))
         .expect("retried request body should be captured");
     assert_eq!(first, retry);
+    let batch: Value = serde_json::from_slice(&retry).expect("retry body should be JSON");
+    assert_eq!(
+        batch[0]["variations"][0]["variation"]["value"].as_str(),
+        Some(large_json.as_str())
+    );
 }

@@ -411,6 +411,7 @@ version = "0.1.0-beta.2"
 dependencies = [
  "arc-swap",
  "axum",
+ "bytes",
  "chrono",
  "crossbeam-channel",
  "env_logger",

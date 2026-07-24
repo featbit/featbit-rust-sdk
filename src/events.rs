@@ -331,6 +331,10 @@ impl PendingEvent {
     fn mark_dequeued(&mut self) {
         self.admission.mark_dequeued();
     }
+
+    const fn retained_bytes(&self) -> usize {
+        self.admission.retained_bytes
+    }
 }
 
 impl serde::Serialize for PendingEvent {
