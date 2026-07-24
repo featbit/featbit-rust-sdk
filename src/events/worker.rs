@@ -2,7 +2,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use crossbeam_channel::{Receiver, TryRecvError};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use reqwest::{Client, StatusCode};
 use tokio::runtime::Runtime;
 use tokio::sync::watch;
@@ -11,8 +13,7 @@ use url::Url;
 use crate::options::FbOptions;
 use crate::user_agent;
 
-use super::payload::PayloadEvent;
-use super::{EventMessage, Shutdown};
+use super::{EventMessage, PendingEvent, Shutdown};
 
 #[derive(Clone, Debug)]
 pub(super) struct EventWorkerConfig {
@@ -42,7 +43,7 @@ impl EventWorkerConfig {
 pub(super) struct EventWorker {
     config: EventWorkerConfig,
     client: Option<Client>,
-    buffer: Vec<PayloadEvent>,
+    buffer: Vec<PendingEvent>,
     delivery_stopped: bool,
     shared_delivery_stopped: Arc<AtomicBool>,
     unreported_delivery_failure: bool,
@@ -51,15 +52,7 @@ pub(super) struct EventWorker {
 
 impl EventWorker {
     pub(super) fn new(config: EventWorkerConfig, shared_delivery_stopped: Arc<AtomicBool>) -> Self {
-        let client = Client::builder()
-            .connect_timeout(config.request_timeout.min(Duration::from_secs(1)))
-            .timeout(config.request_timeout)
-            .build()
-            .map_err(|error| {
-                log::error!("failed to build FeatBit event HTTP client: {error}");
-                error
-            })
-            .ok();
+        let client = build_http_client(&config);
         Self {
             config,
             client,
@@ -145,7 +138,8 @@ impl EventWorker {
         abort: &mut watch::Receiver<bool>,
     ) -> bool {
         match message {
-            EventMessage::Payload(event) => {
+            EventMessage::Payload(mut event) => {
+                event.mark_dequeued();
                 if !self.delivery_stopped {
                     self.buffer.push(event);
                     if self.buffer.len() >= self.config.max_events_per_request {
@@ -184,11 +178,23 @@ impl EventWorker {
             return FlushOutcome::delivered();
         }
 
-        let events = std::mem::take(&mut self.buffer);
+        let mut events = std::mem::take(&mut self.buffer);
         log::debug!("flushing {} FeatBit events", events.len());
+        let outcome = self.deliver_events(&events, runtime, abort);
+        events.clear();
+        self.buffer = events;
+        outcome
+    }
+
+    fn deliver_events(
+        &mut self,
+        events: &[PendingEvent],
+        runtime: &Runtime,
+        abort: &mut watch::Receiver<bool>,
+    ) -> FlushOutcome {
         let mut delivered = true;
         for chunk in events.chunks(self.config.max_events_per_request) {
-            let payload = match serde_json::to_vec(chunk) {
+            let payload = match serialize_events(chunk) {
                 Ok(payload) => payload,
                 Err(error) => {
                     log::warn!("failed to serialize FeatBit events: {error}");
@@ -196,7 +202,7 @@ impl EventWorker {
                     continue;
                 }
             };
-            match runtime.block_on(self.send(&payload, abort)) {
+            match runtime.block_on(self.send(payload, abort)) {
                 Delivery::Fatal => {
                     self.delivery_stopped = true;
                     self.shared_delivery_stopped.store(true, Ordering::Release);
@@ -214,7 +220,7 @@ impl EventWorker {
         }
     }
 
-    async fn send(&self, payload: &[u8], abort: &mut watch::Receiver<bool>) -> Delivery {
+    async fn send(&self, payload: Bytes, abort: &mut watch::Receiver<bool>) -> Delivery {
         let Some(client) = &self.client else {
             return Delivery::Fatal;
         };
@@ -229,16 +235,7 @@ impl EventWorker {
             }
             let request = client
                 .post(self.config.endpoint.clone())
-                .header(
-                    reqwest::header::AUTHORIZATION,
-                    self.config.env_secret.as_ref(),
-                )
-                .header(reqwest::header::USER_AGENT, user_agent())
-                .header(
-                    reqwest::header::CONTENT_TYPE,
-                    "application/json; charset=utf-8",
-                )
-                .body(payload.to_vec())
+                .body(payload.clone())
                 .send();
             let response = tokio::select! {
                 biased;
@@ -270,6 +267,45 @@ impl EventWorker {
         log::warn!("FeatBit event delivery exhausted its configured retry attempts");
         Delivery::Failed
     }
+}
+
+fn serialize_events(events: &[PendingEvent]) -> serde_json::Result<Bytes> {
+    let estimated_size = events.iter().fold(2_usize, |size, event| {
+        size.saturating_add(event.retained_bytes())
+    });
+    let mut payload = Vec::with_capacity(estimated_size);
+    serde_json::to_writer(&mut payload, events)?;
+    Ok(Bytes::from(payload))
+}
+
+fn build_http_client(config: &EventWorkerConfig) -> Option<Client> {
+    let Ok(mut authorization) = HeaderValue::from_bytes(config.env_secret.as_bytes()) else {
+        log::error!("failed to build FeatBit event authorization header");
+        return None;
+    };
+    authorization.set_sensitive(true);
+    let Ok(agent) = HeaderValue::from_bytes(user_agent().as_bytes()) else {
+        log::error!("failed to build FeatBit event user-agent header");
+        return None;
+    };
+    let mut headers = HeaderMap::with_capacity(3);
+    headers.insert(AUTHORIZATION, authorization);
+    headers.insert(USER_AGENT, agent);
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/json; charset=utf-8"),
+    );
+
+    Client::builder()
+        .connect_timeout(config.request_timeout.min(Duration::from_secs(1)))
+        .timeout(config.request_timeout)
+        .default_headers(headers)
+        .build()
+        .map_err(|error| {
+            log::error!("failed to build FeatBit event HTTP client: {error}");
+            error
+        })
+        .ok()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -354,9 +390,20 @@ pub(super) fn event_endpoint(base: &Url) -> Url {
 
 #[cfg(test)]
 mod tests {
-    use reqwest::StatusCode;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::Duration;
 
-    use super::is_recoverable;
+    use reqwest::StatusCode;
+    use tokio::runtime::Builder as RuntimeBuilder;
+    use tokio::sync::watch;
+
+    use super::{is_recoverable, EventWorker, EventWorkerConfig, FlushOutcome};
+    use crate::events::payload::PayloadEvent;
+    use crate::events::{EventCapacity, PendingEvent};
+    use crate::model::FbUser;
+    use crate::options::FbOptionsBuilder;
+    use crate::test_support::scripted_http_server;
 
     #[test]
     fn http_delivery_classification_matches_featbit_retry_contract() {
@@ -371,5 +418,89 @@ mod tests {
         for fatal in [StatusCode::UNAUTHORIZED, StatusCode::NOT_FOUND] {
             assert!(!is_recoverable(fatal));
         }
+    }
+
+    #[test]
+    fn successful_flush_reuses_the_worker_batch_allocation() {
+        let (event_url, _bodies, server) = scripted_http_server([202, 202]);
+        let options = FbOptionsBuilder::new("valid-secret")
+            .event_url(event_url)
+            .auto_flush_interval(Duration::from_mins(1))
+            .build()
+            .expect("options should build");
+        let config = EventWorkerConfig::from_options(&options);
+        let mut worker = EventWorker::new(config, Arc::new(AtomicBool::new(false)));
+        worker.buffer = Vec::with_capacity(8);
+        worker.buffer.push(pending_metric("first"));
+        let original_capacity = worker.buffer.capacity();
+        let original_allocation = worker.buffer.as_ptr();
+        let runtime = RuntimeBuilder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("event runtime should build");
+        let (_abort_sender, mut abort) = watch::channel(false);
+
+        assert_eq!(
+            worker.flush(&runtime, &mut abort),
+            FlushOutcome::delivered()
+        );
+        assert!(worker.buffer.is_empty());
+        assert_eq!(worker.buffer.capacity(), original_capacity);
+        assert_eq!(worker.buffer.as_ptr(), original_allocation);
+
+        worker.buffer.push(pending_metric("second"));
+        assert_eq!(
+            worker.flush(&runtime, &mut abort),
+            FlushOutcome::delivered()
+        );
+        assert!(worker.buffer.is_empty());
+        assert_eq!(worker.buffer.capacity(), original_capacity);
+        assert_eq!(worker.buffer.as_ptr(), original_allocation);
+        server.join().expect("event server should stop");
+    }
+
+    #[test]
+    fn cancelled_flush_reuses_the_worker_batch_allocation() {
+        let options = FbOptionsBuilder::new("valid-secret")
+            .event_url("http://127.0.0.1:9")
+            .auto_flush_interval(Duration::from_mins(1))
+            .build()
+            .expect("options should build");
+        let config = EventWorkerConfig::from_options(&options);
+        let mut worker = EventWorker::new(config, Arc::new(AtomicBool::new(false)));
+        worker.buffer = Vec::with_capacity(8);
+        worker.buffer.push(pending_metric("cancelled"));
+        let original_capacity = worker.buffer.capacity();
+        let original_allocation = worker.buffer.as_ptr();
+        let runtime = RuntimeBuilder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("event runtime should build");
+        let (_abort_sender, mut abort) = watch::channel(true);
+
+        assert_eq!(
+            worker.flush(&runtime, &mut abort),
+            FlushOutcome::cancelled()
+        );
+        assert!(worker.buffer.is_empty());
+        assert_eq!(worker.buffer.capacity(), original_capacity);
+        assert_eq!(worker.buffer.as_ptr(), original_allocation);
+    }
+
+    fn pending_metric(event_name: &str) -> PendingEvent {
+        let capacity = Arc::new(EventCapacity::new(1, 1_024));
+        let admission = capacity
+            .try_reserve(1_024)
+            .expect("test event capacity should be available");
+        let mut event = PendingEvent {
+            payload: PayloadEvent::metric(
+                &FbUser::builder("buffer-reuse-user").build(),
+                event_name,
+                1.0,
+            ),
+            admission,
+        };
+        event.mark_dequeued();
+        event
     }
 }

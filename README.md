@@ -14,10 +14,6 @@ OpenFeature support lives in the separate
 [FeatBit OpenFeature Provider for Rust](https://github.com/featbit/openfeature-provider-rust-server)
 repository.
 
-When upgrading from `0.1.0-beta.1`, replace the core crate's `FeatBitProvider` import and
-`open-feature` dependency with `featbit-openfeature-provider`. Direct `FbClient` APIs remain in this
-repository.
-
 ## Data Synchronization
 
 The SDK keeps feature flags and segments synchronized over WebSocket and evaluates them from an
@@ -284,8 +280,13 @@ let _accepted = client.track_metric_event(user, "checkout-completed", 1.0);
 # }
 ```
 
-Evaluation and tracking calls enqueue into a bounded queue without waiting for network I/O.
-Analytics may be dropped under sustained overload rather than delaying application requests.
+Evaluation and tracking calls enqueue without waiting for network I/O. Pending analytics are
+bounded by both event count (10,000 by default) and approximate retained payload memory (64 MiB by
+default), including queued, buffered, and in-flight events. Large user attributes and JSON
+variation values are delivered intact when admitted; the SDK never truncates them. Applications
+that intentionally send larger payloads can raise
+`FbOptionsBuilder::max_event_queue_size_bytes`. Analytics may be dropped under sustained overload
+rather than delaying application requests.
 
 ### Integration Adapters
 

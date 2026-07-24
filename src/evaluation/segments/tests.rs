@@ -3,7 +3,7 @@ use std::sync::Arc;
 use super::rule_matches_prepared;
 use crate::model::{Condition, FbUser, MatchRule, Segment, TargetRule};
 use crate::prepared::{IS_IN_SEGMENT, IS_NOT_IN_SEGMENT};
-use crate::store::DataSnapshot;
+use crate::store::{test_snapshot_map, DataSnapshot};
 
 fn rule_matches(snapshot: &DataSnapshot, rule: &TargetRule, user: &FbUser) -> bool {
     rule_matches_prepared(snapshot, rule, None, user)
@@ -32,7 +32,7 @@ fn segment_exclusion_precedes_inclusion_and_rules() {
         value: "[\"segment-1\"]".to_owned(),
     };
     let snapshot = DataSnapshot {
-        segments: [(segment.id.clone(), Arc::new(segment))].into(),
+        segments: test_snapshot_map([(segment.id.clone(), Arc::new(segment))]),
         populated: true,
         ..DataSnapshot::default()
     };
@@ -69,7 +69,7 @@ fn direct_segment_rule_requires_every_condition() {
         ..Segment::default()
     };
     let snapshot = DataSnapshot {
-        segments: [(segment.id.clone(), Arc::new(segment))].into(),
+        segments: test_snapshot_map([(segment.id.clone(), Arc::new(segment))]),
         populated: true,
         ..DataSnapshot::default()
     };
@@ -152,10 +152,11 @@ fn segment_conditions_match_dotnet_for_all_valid_shapes() {
         },
     ];
     let snapshot = DataSnapshot {
-        segments: segments
-            .into_iter()
-            .map(|segment| (segment.id.clone(), Arc::new(segment)))
-            .collect(),
+        segments: test_snapshot_map(
+            segments
+                .into_iter()
+                .map(|segment| (segment.id.clone(), Arc::new(segment))),
+        ),
         populated: true,
         ..DataSnapshot::default()
     };
@@ -197,7 +198,7 @@ fn segment_conditions_match_dotnet_for_all_valid_shapes() {
 fn invalid_segment_references_never_match_positive_or_negative_conditions() {
     let user = FbUser::builder("user-1").build();
     let snapshot = DataSnapshot {
-        segments: [
+        segments: test_snapshot_map([
             (
                 "archived".to_owned(),
                 Arc::new(Segment {
@@ -217,8 +218,7 @@ fn invalid_segment_references_never_match_positive_or_negative_conditions() {
                     ..Segment::default()
                 }),
             ),
-        ]
-        .into(),
+        ]),
         populated: true,
         ..DataSnapshot::default()
     };

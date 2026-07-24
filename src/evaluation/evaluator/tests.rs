@@ -1,16 +1,15 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
 
 use super::Evaluator;
 use crate::evaluation::dispatch::rollout_of_key;
 use crate::evaluation::test_support::{basic_flag, rollout};
-use crate::evaluation::{EvalError, EvaluationReason};
+use crate::evaluation::{EvalError, EvalReason};
 use crate::model::{
     Condition, DataSet, Fallthrough, FbUser, RolloutVariation, Segment, TargetRule, TargetUser,
 };
 use crate::prepared::IS_IN_SEGMENT;
-use crate::store::{DataSnapshot, SnapshotStore};
+use crate::store::{test_snapshot_map, DataSnapshot, SnapshotStore};
 
 #[test]
 fn missing_archived_invalid_context_and_malformed_flags_return_typed_errors() {
@@ -23,10 +22,11 @@ fn missing_archived_invalid_context_and_malformed_flags_return_typed_errors() {
     let mut malformed_fallthrough = basic_flag("malformed-fallthrough");
     malformed_fallthrough.fallthrough.variations.clear();
     let snapshot = DataSnapshot {
-        flags: [archived, malformed_off, malformed_fallthrough]
-            .into_iter()
-            .map(|flag| (flag.key.clone(), Arc::new(flag)))
-            .collect(),
+        flags: test_snapshot_map(
+            [archived, malformed_off, malformed_fallthrough]
+                .into_iter()
+                .map(|flag| (flag.key.clone(), Arc::new(flag))),
+        ),
         populated: true,
         ..DataSnapshot::default()
     };
@@ -51,6 +51,33 @@ fn missing_archived_invalid_context_and_malformed_flags_return_typed_errors() {
         Evaluator::evaluate(&snapshot, "malformed-off", &FbUser::builder("").build()).unwrap_err(),
         EvalError::InvalidContext
     );
+}
+
+#[test]
+fn successful_result_borrows_flag_and_variation_from_the_snapshot() {
+    let flag = basic_flag("borrowed");
+    let snapshot = DataSnapshot {
+        flags: test_snapshot_map([(flag.key.clone(), Arc::new(flag))]),
+        ..DataSnapshot::default()
+    };
+    let stored_flag = snapshot
+        .flags
+        .get("borrowed")
+        .expect("stored flag should remain available");
+    let stored_variation = stored_flag
+        .variations
+        .first()
+        .expect("basic flag should contain a variation");
+    let user = FbUser::builder("user").build();
+
+    let result = Evaluator::evaluate(&snapshot, "borrowed", &user).expect("flag should evaluate");
+
+    assert!(std::ptr::eq(result.flag_id, stored_flag.id.as_str()));
+    assert!(std::ptr::eq(
+        result.flag_type,
+        stored_flag.variation_type.as_str()
+    ));
+    assert!(std::ptr::eq(result.variation, stored_variation));
 }
 
 #[test]
@@ -82,29 +109,27 @@ fn evaluation_order_is_off_target_rule_then_fallthrough() {
     });
 
     let snapshot = DataSnapshot {
-        flags: [off, target, rule]
-            .into_iter()
-            .map(|flag| (flag.key.clone(), Arc::new(flag)))
-            .collect::<HashMap<_, _>>(),
+        flags: test_snapshot_map(
+            [off, target, rule]
+                .into_iter()
+                .map(|flag| (flag.key.clone(), Arc::new(flag))),
+        ),
         populated: true,
         ..DataSnapshot::default()
     };
 
     let off_result = Evaluator::evaluate(&snapshot, "off", &user).expect("off should resolve");
     assert_eq!(off_result.variation.value, "false");
-    assert_eq!(off_result.reason, EvaluationReason::Off);
+    assert_eq!(off_result.reason, EvalReason::Off);
 
     let target_result =
         Evaluator::evaluate(&snapshot, "target", &user).expect("target should resolve");
     assert_eq!(target_result.variation.value, "false");
-    assert_eq!(target_result.reason, EvaluationReason::TargetMatch);
+    assert_eq!(target_result.reason, EvalReason::TargetMatch);
 
     let rule_result = Evaluator::evaluate(&snapshot, "rule", &user).expect("rule should resolve");
     assert_eq!(rule_result.variation.value, "false");
-    assert!(matches!(
-        rule_result.reason,
-        EvaluationReason::RuleMatch { .. }
-    ));
+    assert!(matches!(rule_result.reason, EvalReason::RuleMatch { .. }));
 }
 
 #[test]
@@ -144,7 +169,7 @@ fn rules_are_and_conditions_and_first_match_wins() {
         },
     ];
     let snapshot = DataSnapshot {
-        flags: [(flag.key.clone(), Arc::new(flag))].into(),
+        flags: test_snapshot_map([(flag.key.clone(), Arc::new(flag))]),
         populated: true,
         ..DataSnapshot::default()
     };
@@ -153,7 +178,7 @@ fn rules_are_and_conditions_and_first_match_wins() {
     assert_eq!(result.variation.value, "false");
     assert!(matches!(
         result.reason,
-        EvaluationReason::RuleMatch { ref name, .. } if name == "complete"
+        EvalReason::RuleMatch { name, .. } if name == "complete"
     ));
 }
 
@@ -197,10 +222,11 @@ fn experiment_delivery_matches_dotnet_target_rule_and_fallthrough_semantics() {
     };
 
     let snapshot = DataSnapshot {
-        flags: [targeted, rule, fallthrough]
-            .into_iter()
-            .map(|flag| (flag.key.clone(), Arc::new(flag)))
-            .collect(),
+        flags: test_snapshot_map(
+            [targeted, rule, fallthrough]
+                .into_iter()
+                .map(|flag| (flag.key.clone(), Arc::new(flag))),
+        ),
         populated: true,
         ..DataSnapshot::default()
     };
@@ -243,7 +269,7 @@ fn rollout_selection_uses_dotnet_default_and_custom_dispatch_keys() {
     let mut default_key_flag = basic_flag("test-");
     default_key_flag.fallthrough.variations = variations.clone();
     let default_snapshot = DataSnapshot {
-        flags: [(default_key_flag.key.clone(), Arc::new(default_key_flag))].into(),
+        flags: test_snapshot_map([(default_key_flag.key.clone(), Arc::new(default_key_flag))]),
         populated: true,
         ..DataSnapshot::default()
     };
@@ -262,14 +288,14 @@ fn rollout_selection_uses_dotnet_default_and_custom_dispatch_keys() {
     assert_eq!(default_result.variation.id, "false");
     assert_eq!(
         default_result.reason,
-        EvaluationReason::Fallthrough { split: true }
+        EvalReason::Fallthrough { split: true }
     );
 
     let mut custom_key_flag = basic_flag("test-");
     custom_key_flag.fallthrough.dispatch_key = Some("bucket".to_owned());
     custom_key_flag.fallthrough.variations = variations;
     let custom_snapshot = DataSnapshot {
-        flags: [(custom_key_flag.key.clone(), Arc::new(custom_key_flag))].into(),
+        flags: test_snapshot_map([(custom_key_flag.key.clone(), Arc::new(custom_key_flag))]),
         populated: true,
         ..DataSnapshot::default()
     };
@@ -288,7 +314,7 @@ fn rollout_selection_uses_dotnet_default_and_custom_dispatch_keys() {
     assert_eq!(custom_result.variation.id, "true");
     assert_eq!(
         custom_result.reason,
-        EvaluationReason::Fallthrough { split: true }
+        EvalReason::Fallthrough { split: true }
     );
 }
 
@@ -304,12 +330,13 @@ fn experiment_sampling_uses_expt_prefixed_dispatch_key() {
     }];
 
     let snapshot = |flag| DataSnapshot {
-        flags: [("test-".to_owned(), Arc::new(flag))].into(),
+        flags: test_snapshot_map([("test-".to_owned(), Arc::new(flag))]),
         populated: true,
         ..DataSnapshot::default()
     };
     let prefixed_rollout = rollout_of_key("expttest-value");
-    let excluded = Evaluator::evaluate(&snapshot(flag.clone()), "test-", &user)
+    let excluded_snapshot = snapshot(flag.clone());
+    let excluded = Evaluator::evaluate(&excluded_snapshot, "test-", &user)
         .expect("fallthrough should resolve");
     println!(
         "evaluation experiment_dispatch_key=\"expttest-value\" rollout={prefixed_rollout:.17} experiment_upper=0.50000000000000000 send_to_experiment={}",
@@ -323,7 +350,8 @@ fn experiment_sampling_uses_expt_prefixed_dispatch_key() {
 
     let mut included_flag = flag;
     included_flag.fallthrough.variations[0].expt_rollout = 0.6;
-    let included = Evaluator::evaluate(&snapshot(included_flag), "test-", &user)
+    let included_snapshot = snapshot(included_flag);
+    let included = Evaluator::evaluate(&included_snapshot, "test-", &user)
         .expect("fallthrough should resolve");
     println!(
         "evaluation experiment_dispatch_key=\"expttest-value\" rollout={prefixed_rollout:.17} experiment_upper=0.60000000000000000 send_to_experiment={}",
@@ -375,8 +403,8 @@ fn preprocessed_snapshot_preserves_rule_and_segment_results() {
     });
 
     let raw = DataSnapshot {
-        flags: [(flag.key.clone(), Arc::new(flag.clone()))].into(),
-        segments: [(segment.id.clone(), Arc::new(segment.clone()))].into(),
+        flags: test_snapshot_map([(flag.key.clone(), Arc::new(flag.clone()))]),
+        segments: test_snapshot_map([(segment.id.clone(), Arc::new(segment.clone()))]),
         populated: true,
         ..DataSnapshot::default()
     };
@@ -453,7 +481,7 @@ fn concurrent_full_updates_never_mix_flags_and_segments() {
                     let result = Evaluator::evaluate(&snapshot, "consistent", &user)
                         .expect("each complete snapshot should evaluate");
                     assert_eq!(result.variation.value, "false");
-                    assert!(matches!(result.reason, EvaluationReason::RuleMatch { .. }));
+                    assert!(matches!(result.reason, EvalReason::RuleMatch { .. }));
                 }
             })
         })

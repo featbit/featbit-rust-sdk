@@ -38,6 +38,7 @@ impl FbOptionsBuilder {
             flush_timeout: self.flush_timeout,
             event_request_timeout: self.event_request_timeout,
             max_events_in_queue: self.max_events_in_queue,
+            max_event_queue_size_bytes: self.max_event_queue_size_bytes,
             max_events_per_request: self.max_events_per_request,
             max_send_event_attempts: self.max_send_event_attempts,
             send_event_retry_interval: self.send_event_retry_interval,
@@ -119,6 +120,11 @@ impl FbOptionsBuilder {
         }
 
         validate_capacity("max_events_in_queue", self.max_events_in_queue, 1_000_000)?;
+        validate_capacity(
+            "max_event_queue_size_bytes",
+            self.max_event_queue_size_bytes,
+            1024 * 1024 * 1024,
+        )?;
         validate_capacity(
             "max_events_per_request",
             self.max_events_per_request,

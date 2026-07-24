@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crossbeam_channel::{bounded, Receiver};
 
-fn read_request_body(stream: &mut std::net::TcpStream) -> Vec<u8> {
+pub(crate) fn read_request_body(stream: &mut std::net::TcpStream) -> Vec<u8> {
     stream
         .set_read_timeout(Some(Duration::from_secs(2)))
         .expect("test stream should configure a timeout");

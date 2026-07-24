@@ -241,8 +241,8 @@ impl FbClient {
         };
         let event = FbEvaluationEvent::new(
             flag_key,
-            result.variation.id,
-            result.variation.value,
+            result.variation.id.as_str(),
+            result.variation.value.as_str(),
             result.send_to_experiment,
         );
         self.inner.event_processor.record_evaluation(user, &event)

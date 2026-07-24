@@ -21,6 +21,7 @@ fn defaults_match_the_featbit_server_contract() {
     assert_eq!(options.flush_timeout, Duration::from_secs(5));
     assert_eq!(options.event_request_timeout, Duration::from_secs(2));
     assert_eq!(options.max_events_in_queue, 10_000);
+    assert_eq!(options.max_event_queue_size_bytes, 64 * 1024 * 1024);
     assert_eq!(options.max_events_per_request, 50);
     assert_eq!(options.max_send_event_attempts, 2);
     assert_eq!(
@@ -203,9 +204,12 @@ fn validation_rejects_every_non_progressing_duration_and_capacity() {
         ));
     }
 
-    let zero_capacities: [(&str, BuilderUpdate); 4] = [
+    let zero_capacities: [(&str, BuilderUpdate); 5] = [
         ("max_events_in_queue", |builder| {
             builder.max_events_in_queue(0)
+        }),
+        ("max_event_queue_size_bytes", |builder| {
+            builder.max_event_queue_size_bytes(0)
         }),
         ("max_events_per_request", |builder| {
             builder.max_events_per_request(0)
@@ -288,6 +292,15 @@ fn validation_rejects_invalid_secret_url_and_limit_relationships() {
             .build(),
         Err(ConfigError::InvalidCapacity {
             field: "max_events_in_queue",
+            ..
+        })
+    ));
+    assert!(matches!(
+        FbOptionsBuilder::new("valid-secret")
+            .max_event_queue_size_bytes(1024 * 1024 * 1024 + 1)
+            .build(),
+        Err(ConfigError::InvalidCapacity {
+            field: "max_event_queue_size_bytes",
             ..
         })
     ));
