@@ -3,9 +3,9 @@ use std::thread;
 
 use super::*;
 use crate::evaluation::test_support::{basic_flag, rollout};
-use crate::evaluation::{EvaluationReason, Evaluator};
+use crate::evaluation::{EvalReason, Evaluator};
 use crate::model::FbUser;
-use crate::model::{Condition, TargetRule};
+use crate::model::{Condition, TargetRule, Variation};
 use crate::prepared::{PreparedCondition, IS_IN_SEGMENT};
 
 fn flag(key: &str, updated_at: i64, is_archived: bool) -> FeatureFlag {
@@ -89,7 +89,8 @@ fn concurrent_patches_cannot_overwrite_each_others_changes() {
     let snapshot = store.load();
     assert_eq!(snapshot.flags.len(), WRITERS);
     for index in 0..WRITERS {
-        assert!(snapshot.flags.contains_key(&format!("flag-{index}")));
+        let key = format!("flag-{index}");
+        assert!(snapshot.flags.contains_key(key.as_str()));
     }
 }
 
@@ -131,6 +132,164 @@ fn publication_prepares_conditions_and_reuses_unchanged_indexes() {
     assert!(Arc::ptr_eq(&prepared, &patched.prepared.flags["prepared"]));
 }
 
+const LARGE_STORE_OBJECTS: usize = 2_048;
+
+fn large_store() -> SnapshotStore {
+    let large_json = format!(r#"{{"payload":"{}"}}"#, "x".repeat(512 * 1024));
+    let mut feature_flags = (0..LARGE_STORE_OBJECTS)
+        .map(|index| {
+            flag(
+                &format!("flag-with-a-deliberately-long-key-{index}"),
+                1,
+                false,
+            )
+        })
+        .collect::<Vec<_>>();
+    feature_flags[0].variations.push(Variation {
+        id: "large-json".to_owned(),
+        value: large_json,
+    });
+    let segments = (0..LARGE_STORE_OBJECTS)
+        .map(|index| Segment {
+            id: format!("segment-with-a-deliberately-long-id-{index}"),
+            updated_at: 1,
+            ..Segment::default()
+        })
+        .collect::<Vec<_>>();
+    let store = SnapshotStore::new();
+    store.populate(&DataSet {
+        event_type: "full".to_owned(),
+        feature_flags,
+        segments,
+    });
+    store
+}
+
+#[test]
+fn flag_patch_copies_only_flag_maps_and_shares_large_values_and_keys() {
+    let store = large_store();
+    let initial = store.load();
+    let (initial_flag_key, initial_large_flag) = initial
+        .flags
+        .get_key_value("flag-with-a-deliberately-long-key-0")
+        .expect("large flag should exist");
+    let (initial_prepared_key, initial_prepared_flag) = initial
+        .prepared
+        .flags
+        .get_key_value("flag-with-a-deliberately-long-key-0")
+        .expect("prepared large flag should exist");
+    assert!(Arc::ptr_eq(initial_flag_key, initial_prepared_key));
+
+    let changed_flag_key = format!(
+        "flag-with-a-deliberately-long-key-{}",
+        LARGE_STORE_OBJECTS - 1
+    );
+    assert_eq!(
+        store.patch(&DataSet {
+            event_type: "patch".to_owned(),
+            feature_flags: vec![flag(&changed_flag_key, 2, false)],
+            ..DataSet::default()
+        }),
+        PatchResult::Changed
+    );
+    let after_flag_patch = store.load();
+    assert!(!Arc::ptr_eq(&initial.flags, &after_flag_patch.flags));
+    assert!(!Arc::ptr_eq(
+        &initial.prepared.flags,
+        &after_flag_patch.prepared.flags
+    ));
+    assert!(Arc::ptr_eq(&initial.segments, &after_flag_patch.segments));
+    assert!(Arc::ptr_eq(
+        &initial.prepared.segments,
+        &after_flag_patch.prepared.segments
+    ));
+    assert!(Arc::ptr_eq(
+        initial_large_flag,
+        &after_flag_patch.flags["flag-with-a-deliberately-long-key-0"]
+    ));
+    assert!(Arc::ptr_eq(
+        initial_prepared_flag,
+        &after_flag_patch.prepared.flags["flag-with-a-deliberately-long-key-0"]
+    ));
+    let (patched_flag_key, _) = after_flag_patch
+        .flags
+        .get_key_value("flag-with-a-deliberately-long-key-0")
+        .expect("large flag should remain");
+    assert!(Arc::ptr_eq(initial_flag_key, patched_flag_key));
+
+    assert_eq!(
+        store.patch(&DataSet {
+            event_type: "patch".to_owned(),
+            feature_flags: vec![flag(&changed_flag_key, 2, false)],
+            ..DataSet::default()
+        }),
+        PatchResult::Unchanged
+    );
+    assert!(Arc::ptr_eq(&after_flag_patch, &store.load()));
+}
+
+#[test]
+fn segment_patch_copies_only_segment_maps() {
+    let store = large_store();
+    let initial = store.load();
+    let changed_segment_id = format!(
+        "segment-with-a-deliberately-long-id-{}",
+        LARGE_STORE_OBJECTS - 1
+    );
+    assert_eq!(
+        store.patch(&DataSet {
+            event_type: "patch".to_owned(),
+            segments: vec![Segment {
+                id: changed_segment_id,
+                updated_at: 2,
+                ..Segment::default()
+            }],
+            ..DataSet::default()
+        }),
+        PatchResult::Changed
+    );
+    let after_segment_patch = store.load();
+    assert!(Arc::ptr_eq(&initial.flags, &after_segment_patch.flags));
+    assert!(Arc::ptr_eq(
+        &initial.prepared.flags,
+        &after_segment_patch.prepared.flags
+    ));
+    assert!(!Arc::ptr_eq(
+        &initial.segments,
+        &after_segment_patch.segments
+    ));
+    assert!(!Arc::ptr_eq(
+        &initial.prepared.segments,
+        &after_segment_patch.prepared.segments
+    ));
+}
+
+#[test]
+fn first_empty_patch_publishes_without_copying_empty_maps() {
+    let store = SnapshotStore::new();
+    let empty = store.load();
+
+    assert_eq!(
+        store.patch(&DataSet {
+            event_type: "patch".to_owned(),
+            ..DataSet::default()
+        }),
+        PatchResult::Unchanged
+    );
+    let populated = store.load();
+    assert!(populated.populated);
+    assert!(Arc::ptr_eq(&empty.flags, &populated.flags));
+    assert!(Arc::ptr_eq(&empty.segments, &populated.segments));
+    assert!(Arc::ptr_eq(
+        &empty.prepared.flags,
+        &populated.prepared.flags
+    ));
+    assert!(Arc::ptr_eq(
+        &empty.prepared.segments,
+        &populated.prepared.segments
+    ));
+}
+
 #[test]
 fn equal_version_with_different_content_reports_a_conflict() {
     let store = SnapshotStore::new();
@@ -139,6 +298,7 @@ fn equal_version_with_different_content_reports_a_conflict() {
         feature_flags: vec![flag("same-version", 7, false)],
         ..DataSet::default()
     });
+    let initial = store.load();
 
     assert_eq!(
         store.patch(&DataSet {
@@ -148,7 +308,9 @@ fn equal_version_with_different_content_reports_a_conflict() {
         }),
         PatchResult::VersionConflict
     );
-    assert!(!store.load().flags["same-version"].is_archived);
+    let after_conflict = store.load();
+    assert!(Arc::ptr_eq(&initial, &after_conflict));
+    assert!(!after_conflict.flags["same-version"].is_archived);
 
     assert_eq!(
         store.patch(&DataSet {
@@ -321,7 +483,7 @@ fn concurrent_evaluation_never_observes_a_partial_flag_and_segment_patch() {
                     let result = Evaluator::evaluate(&snapshot, "patch-consistent", &user)
                         .expect("every atomically published patch should evaluate");
                     assert_eq!(result.variation.value, "false");
-                    assert!(matches!(result.reason, EvaluationReason::RuleMatch { .. }));
+                    assert!(matches!(result.reason, EvalReason::RuleMatch { .. }));
                 }
             })
         })

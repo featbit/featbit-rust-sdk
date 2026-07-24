@@ -2,19 +2,19 @@ use crate::model::{FbUser, FeatureFlag, RolloutVariation, Variation};
 use crate::prepared::PreparedFlag;
 use crate::store::DataSnapshot;
 
-use super::dispatch::{is_in_rollout, is_percentage_split};
+use super::dispatch::{is_in_rollout, is_percentage_split, RolloutMatcher};
 use super::segments::rule_matches_prepared;
-use super::{EvalError, EvalResult, EvaluationReason};
+use super::{EvalError, EvalReason, EvalResult};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct Evaluator;
 
 impl Evaluator {
-    pub(crate) fn evaluate(
-        snapshot: &DataSnapshot,
+    pub(crate) fn evaluate<'snapshot>(
+        snapshot: &'snapshot DataSnapshot,
         flag_key: &str,
         user: &FbUser,
-    ) -> Result<EvalResult, EvalError> {
+    ) -> Result<EvalResult<'snapshot>, EvalError> {
         if user.key().is_empty() {
             return Err(EvalError::InvalidContext);
         }
@@ -29,16 +29,16 @@ impl Evaluator {
         Self::evaluate_flag(snapshot, flag, prepared, user)
     }
 
-    fn evaluate_flag(
-        snapshot: &DataSnapshot,
-        flag: &FeatureFlag,
+    fn evaluate_flag<'snapshot>(
+        snapshot: &'snapshot DataSnapshot,
+        flag: &'snapshot FeatureFlag,
         prepared: Option<&PreparedFlag>,
         user: &FbUser,
-    ) -> Result<EvalResult, EvalError> {
+    ) -> Result<EvalResult<'snapshot>, EvalError> {
         if !flag.is_enabled {
             let variation = Self::variation(flag, prepared, &flag.disabled_variation_id)
                 .ok_or(EvalError::MalformedFlag)?;
-            return Ok(Self::result(flag, variation, EvaluationReason::Off, false));
+            return Ok(Self::result(flag, variation, EvalReason::Off, false));
         }
 
         let target_variation = prepared
@@ -55,7 +55,7 @@ impl Evaluator {
             return Ok(Self::result(
                 flag,
                 variation,
-                EvaluationReason::TargetMatch,
+                EvalReason::TargetMatch,
                 flag.expt_include_all_targets,
             ));
         }
@@ -80,8 +80,8 @@ impl Evaluator {
             return Ok(Self::result(
                 flag,
                 variation,
-                EvaluationReason::RuleMatch {
-                    name: rule.name.clone(),
+                EvalReason::RuleMatch {
+                    name: &rule.name,
                     split: is_percentage_split(&rule.variations),
                 },
                 send_to_experiment,
@@ -102,23 +102,23 @@ impl Evaluator {
         Ok(Self::result(
             flag,
             variation,
-            EvaluationReason::Fallthrough {
+            EvalReason::Fallthrough {
                 split: is_percentage_split(&flag.fallthrough.variations),
             },
             send_to_experiment,
         ))
     }
 
-    fn result(
-        flag: &FeatureFlag,
-        variation: &Variation,
-        reason: EvaluationReason,
+    fn result<'snapshot>(
+        flag: &'snapshot FeatureFlag,
+        variation: &'snapshot Variation,
+        reason: EvalReason<'snapshot>,
         send_to_experiment: bool,
-    ) -> EvalResult {
+    ) -> EvalResult<'snapshot> {
         EvalResult {
-            flag_id: flag.id.clone(),
-            flag_type: flag.variation_type.clone(),
-            variation: variation.clone(),
+            flag_id: &flag.id,
+            flag_type: &flag.variation_type,
+            variation,
             reason,
             send_to_experiment,
         }
@@ -146,9 +146,10 @@ impl Evaluator {
         rollouts: &'a [RolloutVariation],
         dispatch_key: &str,
     ) -> Option<&'a RolloutVariation> {
+        let mut matcher = RolloutMatcher::new(dispatch_key);
         rollouts
             .iter()
-            .find(|rollout| is_in_rollout(dispatch_key, &rollout.rollout))
+            .find(|rollout| matcher.matches(&rollout.rollout))
     }
 
     fn should_send_to_experiment(

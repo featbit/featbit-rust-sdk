@@ -14,6 +14,9 @@ mod validation;
 
 const DEFAULT_STREAMING_URL: &str = "ws://localhost:5100";
 const DEFAULT_EVENT_URL: &str = "http://localhost:5100";
+// Leaves room for a default 50-event batch containing unusually large variation values while
+// keeping total retained analytics memory finite.
+const DEFAULT_MAX_EVENT_QUEUE_SIZE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_CONFIG_DURATION: Duration = Duration::from_hours(8_760);
 
 const DEFAULT_RECONNECT_DELAYS: [Duration; 10] = [
@@ -51,6 +54,7 @@ pub struct FbOptions {
     pub(crate) flush_timeout: Duration,
     pub(crate) event_request_timeout: Duration,
     pub(crate) max_events_in_queue: usize,
+    pub(crate) max_event_queue_size_bytes: usize,
     pub(crate) max_events_per_request: usize,
     pub(crate) max_send_event_attempts: usize,
     pub(crate) send_event_retry_interval: Duration,
@@ -124,6 +128,10 @@ impl fmt::Debug for FbOptions {
             .field("flush_timeout", &self.flush_timeout)
             .field("event_request_timeout", &self.event_request_timeout)
             .field("max_events_in_queue", &self.max_events_in_queue)
+            .field(
+                "max_event_queue_size_bytes",
+                &self.max_event_queue_size_bytes,
+            )
             .field("max_events_per_request", &self.max_events_per_request)
             .field("max_send_event_attempts", &self.max_send_event_attempts)
             .field("send_event_retry_interval", &self.send_event_retry_interval)
@@ -152,6 +160,7 @@ pub struct FbOptionsBuilder {
     flush_timeout: Duration,
     event_request_timeout: Duration,
     max_events_in_queue: usize,
+    max_event_queue_size_bytes: usize,
     max_events_per_request: usize,
     max_send_event_attempts: usize,
     send_event_retry_interval: Duration,
@@ -182,6 +191,10 @@ impl fmt::Debug for FbOptionsBuilder {
             .field("flush_timeout", &self.flush_timeout)
             .field("event_request_timeout", &self.event_request_timeout)
             .field("max_events_in_queue", &self.max_events_in_queue)
+            .field(
+                "max_event_queue_size_bytes",
+                &self.max_event_queue_size_bytes,
+            )
             .field("max_events_per_request", &self.max_events_per_request)
             .field("max_send_event_attempts", &self.max_send_event_attempts)
             .field("send_event_retry_interval", &self.send_event_retry_interval)
@@ -212,6 +225,7 @@ impl FbOptionsBuilder {
             flush_timeout: Duration::from_secs(5),
             event_request_timeout: Duration::from_secs(2),
             max_events_in_queue: 10_000,
+            max_event_queue_size_bytes: DEFAULT_MAX_EVENT_QUEUE_SIZE_BYTES,
             max_events_per_request: 50,
             max_send_event_attempts: 2,
             send_event_retry_interval: Duration::from_millis(200),
@@ -332,6 +346,18 @@ impl FbOptionsBuilder {
     #[must_use]
     pub const fn max_events_in_queue(mut self, capacity: usize) -> Self {
         self.max_events_in_queue = capacity;
+        self
+    }
+
+    /// Sets the approximate retained-memory budget for pending event payloads, in bytes.
+    ///
+    /// The budget covers event data in the queue, the worker batch, and an event batch being sent.
+    /// An event that would exceed the remaining budget is dropped whole; the SDK never truncates
+    /// user attributes or variation values. JSON serialization can temporarily require additional
+    /// memory while a batch is sent.
+    #[must_use]
+    pub const fn max_event_queue_size_bytes(mut self, bytes: usize) -> Self {
+        self.max_event_queue_size_bytes = bytes;
         self
     }
 

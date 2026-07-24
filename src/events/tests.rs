@@ -8,7 +8,7 @@ use serde_json::Value;
 use url::Url;
 
 use super::*;
-use crate::test_support::{disconnect_then_http_server, scripted_http_server};
+use crate::test_support::{disconnect_then_http_server, read_request_body, scripted_http_server};
 
 fn test_user() -> FbUser {
     FbUser::builder("u1")
@@ -173,6 +173,135 @@ fn queue_overflow_warning_state_is_suppressed_until_the_queue_recovers() {
 }
 
 #[test]
+fn retained_size_estimates_cover_owned_payload_allocations() {
+    let user = FbUser::builder("user-with-a-long-key")
+        .name("Ada Lovelace")
+        .custom("country", "China")
+        .custom("organization", "FeatBit")
+        .build();
+    let evaluation = PayloadEvent::evaluation(
+        &user,
+        &FbEvaluationEvent::new(
+            "large-json-flag",
+            "variation-id",
+            r#"{"nested":{"enabled":true,"items":["one","two","three"]}}"#,
+            true,
+        ),
+    );
+    let evaluation_estimate = PayloadEvent::estimated_evaluation_size(
+        &user,
+        "large-json-flag",
+        "variation-id",
+        r#"{"nested":{"enabled":true,"items":["one","two","three"]}}"#,
+    );
+    assert!(evaluation_estimate >= evaluation.retained_size());
+
+    let metric = PayloadEvent::metric(&user, "checkout-completed", 1.0);
+    let metric_estimate = PayloadEvent::estimated_metric_size(&user, "checkout-completed");
+    assert!(metric_estimate >= metric.retained_size());
+}
+
+#[test]
+fn exhausted_capacity_does_not_construct_an_owned_payload() {
+    let options = crate::options::FbOptionsBuilder::new("valid-secret")
+        .auto_flush_interval(Duration::from_mins(1))
+        .max_events_in_queue(2)
+        .max_event_queue_size_bytes(1_024)
+        .build()
+        .expect("options should build");
+    let processor = EventProcessor::new(&options);
+    let EventProcessor::Active(inner) = &processor else {
+        panic!("event processor should start");
+    };
+    let held = inner
+        .capacity
+        .try_reserve(options.max_event_queue_size_bytes)
+        .expect("the test should reserve the full byte budget");
+    let constructed = AtomicBool::new(false);
+
+    assert!(!processor.record(1, || {
+        constructed.store(true, Ordering::Relaxed);
+        PayloadEvent::metric(&test_user(), "should-not-be-built", 1.0)
+    }));
+    assert!(!constructed.load(Ordering::Relaxed));
+    assert_eq!(inner.capacity.queued_events.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        inner.capacity.retained_bytes.load(Ordering::Relaxed),
+        options.max_event_queue_size_bytes
+    );
+
+    drop(held);
+    assert_eq!(inner.capacity.queued_events.load(Ordering::Relaxed), 0);
+    assert_eq!(inner.capacity.retained_bytes.load(Ordering::Relaxed), 0);
+
+    let first_slot = inner
+        .capacity
+        .try_reserve(1)
+        .expect("first queue slot should be available");
+    let second_slot = inner
+        .capacity
+        .try_reserve(1)
+        .expect("second queue slot should be available");
+    assert!(!processor.record(1, || {
+        constructed.store(true, Ordering::Relaxed);
+        PayloadEvent::metric(&test_user(), "still-should-not-be-built", 1.0)
+    }));
+    assert!(!constructed.load(Ordering::Relaxed));
+    drop((first_slot, second_slot));
+    assert_eq!(inner.capacity.queued_events.load(Ordering::Relaxed), 0);
+    assert_eq!(inner.capacity.retained_bytes.load(Ordering::Relaxed), 0);
+    processor.close();
+}
+
+#[test]
+fn byte_capacity_is_atomic_across_concurrent_producers() {
+    const PRODUCERS: usize = 16;
+    const EVENT_BYTES: usize = 256;
+    const MAX_EVENTS: usize = 4;
+
+    let capacity = Arc::new(EventCapacity::new(PRODUCERS, EVENT_BYTES * MAX_EVENTS));
+    let start = Arc::new(Barrier::new(PRODUCERS + 1));
+    let reserved = Arc::new(Barrier::new(PRODUCERS + 1));
+    let release = Arc::new(Barrier::new(PRODUCERS + 1));
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let mut producers = Vec::with_capacity(PRODUCERS);
+
+    for _ in 0..PRODUCERS {
+        let capacity = Arc::clone(&capacity);
+        let start = Arc::clone(&start);
+        let reserved = Arc::clone(&reserved);
+        let release = Arc::clone(&release);
+        let accepted = Arc::clone(&accepted);
+        producers.push(thread::spawn(move || {
+            start.wait();
+            let mut admission = capacity.try_reserve(EVENT_BYTES);
+            if let Some(admission) = admission.as_mut() {
+                admission.mark_dequeued();
+                accepted.fetch_add(1, Ordering::Relaxed);
+            }
+            reserved.wait();
+            release.wait();
+            drop(admission);
+        }));
+    }
+
+    start.wait();
+    reserved.wait();
+    assert_eq!(accepted.load(Ordering::Relaxed), MAX_EVENTS);
+    assert_eq!(capacity.queued_events.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        capacity.retained_bytes.load(Ordering::Relaxed),
+        EVENT_BYTES * MAX_EVENTS
+    );
+    release.wait();
+
+    for producer in producers {
+        producer.join().expect("producer should not panic");
+    }
+    assert_eq!(capacity.retained_bytes.load(Ordering::Relaxed), 0);
+}
+
+#[test]
 fn processor_posts_authorized_event_batch() {
     let mut server = mockito::Server::new();
     let user_agent = crate::user_agent();
@@ -199,6 +328,142 @@ fn processor_posts_authorized_event_batch() {
     processor.close();
     assert!(!processor.flush_and_wait(Duration::from_secs(2)));
     request.assert();
+}
+
+#[test]
+fn large_json_variation_is_delivered_without_truncation() {
+    let large_json = format!(
+        r#"{{"payload":"{}","nested":{{"enabled":true,"items":[1,2,3]}}}}"#,
+        "x".repeat(1024 * 1024)
+    );
+    let (event_url, bodies, server) = scripted_http_server([202]);
+    let options = crate::options::FbOptionsBuilder::new("valid-secret")
+        .event_url(event_url)
+        .auto_flush_interval(Duration::from_mins(1))
+        .event_request_timeout(Duration::from_secs(5))
+        .max_event_queue_size_bytes(4 * 1024 * 1024)
+        .build()
+        .expect("options should build");
+    let processor = EventProcessor::new(&options);
+
+    assert!(processor.record_evaluation(
+        &test_user(),
+        &FbEvaluationEvent::new("json-flag", "json-id", large_json.clone(), false)
+    ));
+    assert!(processor.flush_and_wait(Duration::from_secs(5)));
+    processor.close();
+    server.join().expect("event server should stop");
+
+    let body = bodies
+        .recv_timeout(Duration::from_secs(1))
+        .expect("large event should be delivered");
+    let batch: Value = serde_json::from_slice(&body).expect("event batch should be JSON");
+    assert_eq!(
+        batch[0]["variations"][0]["variation"]["value"].as_str(),
+        Some(large_json.as_str())
+    );
+}
+
+#[test]
+fn oversized_event_is_dropped_whole_and_capacity_recovers() {
+    let (event_url, bodies, server) = scripted_http_server([202]);
+    let options = crate::options::FbOptionsBuilder::new("valid-secret")
+        .event_url(event_url)
+        .auto_flush_interval(Duration::from_mins(1))
+        .max_event_queue_size_bytes(1_024)
+        .build()
+        .expect("options should build");
+    let processor = EventProcessor::new(&options);
+    let EventProcessor::Active(inner) = &processor else {
+        panic!("event processor should start");
+    };
+
+    assert!(!processor.record_evaluation(
+        &test_user(),
+        &FbEvaluationEvent::new("large", "large-id", "x".repeat(4_096), false)
+    ));
+    assert_eq!(inner.capacity.queued_events.load(Ordering::Relaxed), 0);
+    assert_eq!(inner.capacity.retained_bytes.load(Ordering::Relaxed), 0);
+    assert!(processor.record_metric(&test_user(), "small-event", 1.0));
+    assert!(processor.flush_and_wait(Duration::from_secs(2)));
+    processor.close();
+    server.join().expect("event server should stop");
+
+    let body = bodies
+        .recv_timeout(Duration::from_secs(1))
+        .expect("small event should be delivered");
+    let batch: Value = serde_json::from_slice(&body).expect("event batch should be JSON");
+    assert_eq!(batch.as_array().map(Vec::len), Some(1));
+    assert_eq!(batch[0]["metrics"][0]["eventName"], "small-event");
+}
+
+#[test]
+fn byte_budget_covers_an_event_while_its_http_request_is_in_flight() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test listener should bind");
+    let address = listener
+        .local_addr()
+        .expect("test listener should have an address");
+    let (accepted_sender, accepted_receiver) = bounded(1);
+    let (release_sender, release_receiver) = bounded(1);
+    let server = thread::spawn(move || {
+        let (mut stream, _peer) = listener.accept().expect("event request should connect");
+        let _body = read_request_body(&mut stream);
+        accepted_sender
+            .send(())
+            .expect("test should wait for the connection");
+        release_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("test should release the response");
+        write!(
+            stream,
+            "HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .expect("response should write");
+        stream.flush().expect("response should flush");
+    });
+
+    let user = test_user();
+    let variation_value = "x".repeat(4_096);
+    let retained_bytes = PayloadEvent::estimated_evaluation_size(
+        &user,
+        "memory-bound",
+        "variation-id",
+        &variation_value,
+    )
+    .saturating_add(size_of::<EventAdmission>());
+    let options = crate::options::FbOptionsBuilder::new("valid-secret")
+        .event_url(format!("http://{address}"))
+        .auto_flush_interval(Duration::from_mins(1))
+        .event_request_timeout(Duration::from_secs(5))
+        .max_events_in_queue(2)
+        .max_events_per_request(1)
+        .max_event_queue_size_bytes(retained_bytes)
+        .build()
+        .expect("options should build");
+    let processor = EventProcessor::new(&options);
+    let EventProcessor::Active(inner) = &processor else {
+        panic!("event processor should start");
+    };
+    let event = FbEvaluationEvent::new("memory-bound", "variation-id", variation_value, false);
+
+    assert!(processor.record_evaluation(&user, &event));
+    accepted_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("event request should be in flight");
+    assert_eq!(inner.capacity.queued_events.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        inner.capacity.retained_bytes.load(Ordering::Relaxed),
+        retained_bytes
+    );
+    assert!(!processor.record_evaluation(&user, &event));
+
+    release_sender
+        .send(())
+        .expect("server should still be waiting");
+    assert!(processor.flush_and_wait(Duration::from_secs(2)));
+    assert_eq!(inner.capacity.retained_bytes.load(Ordering::Relaxed), 0);
+    processor.close();
+    server.join().expect("event server should stop");
 }
 
 #[test]
@@ -428,6 +693,7 @@ fn full_queue_and_stalled_http_request_do_not_block_concurrent_close() {
 
     assert!(started.elapsed() < Duration::from_secs(2));
     assert!(inner.closed.load(Ordering::Acquire));
+    assert!(inner.close_complete.load(Ordering::Acquire));
     assert!(inner.sender.load_full().is_none());
     assert_eq!(
         inner.worker.wait(Duration::from_secs(1)),
@@ -436,6 +702,74 @@ fn full_queue_and_stalled_http_request_do_not_block_concurrent_close() {
 
     let _ignored = server_stop_sender.send(());
     server.join().expect("test server should stop");
+}
+
+#[test]
+fn additional_close_waits_for_an_in_progress_event_worker() {
+    let (release_sender, release_receiver) = bounded(1);
+    let worker = WorkerThread::spawn("test-event-close-worker", move || {
+        let _released = release_receiver.recv();
+    })
+    .expect("test worker should start");
+    let (sender, _receiver) = bounded(1);
+    let (shutdown_sender, _shutdown_receiver) = bounded(2);
+    let (abort_sender, _abort_receiver) = watch::channel(false);
+    let inner = Arc::new(EventProcessorInner {
+        sender: ArcSwapOption::from(Some(Arc::new(sender))),
+        shutdown_sender,
+        abort_sender,
+        closed: AtomicBool::new(true),
+        close_complete: AtomicBool::new(false),
+        capacity_exceeded: AtomicBool::new(false),
+        capacity: Arc::new(EventCapacity::new(1, 1_024)),
+        delivery_stopped: Arc::new(AtomicBool::new(false)),
+        worker,
+        flush_timeout: Duration::from_secs(1),
+    });
+    let (entered_sender, entered_receiver) = bounded(1);
+    let (completed_sender, completed_receiver) = bounded(1);
+    let closing = Arc::clone(&inner);
+    let closer = thread::spawn(move || {
+        entered_sender
+            .send(())
+            .expect("test should observe close entry");
+        closing.close();
+        completed_sender
+            .send(())
+            .expect("test should observe close completion");
+    });
+
+    entered_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("close thread should start");
+    assert!(
+        completed_receiver
+            .recv_timeout(Duration::from_millis(50))
+            .is_err(),
+        "a concurrent close must not return while the shared worker is still running"
+    );
+    release_sender
+        .send(())
+        .expect("test worker should be released");
+    completed_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("close should finish after the worker");
+    closer.join().expect("close thread should not panic");
+    assert_eq!(inner.worker.wait(Duration::ZERO), WorkerWait::Completed);
+}
+
+#[test]
+fn abnormal_event_worker_exit_stops_new_event_admission() {
+    let delivery_stopped = Arc::new(AtomicBool::new(false));
+    let worker_delivery_stopped = Arc::clone(&delivery_stopped);
+    let worker = WorkerThread::spawn("test-panicking-event-worker", move || {
+        let _stopped_on_exit = EventWorkerStoppedOnExit(worker_delivery_stopped);
+        panic!("simulated event worker failure");
+    })
+    .expect("test worker should start");
+
+    assert_eq!(worker.wait(Duration::from_secs(1)), WorkerWait::Panicked);
+    assert!(delivery_stopped.load(Ordering::Acquire));
 }
 
 #[test]
@@ -571,13 +905,18 @@ fn connection_level_delivery_failure_retries_the_unchanged_batch() {
     let options = crate::options::FbOptionsBuilder::new("valid-secret")
         .event_url(event_url)
         .auto_flush_interval(Duration::from_mins(1))
+        .event_request_timeout(Duration::from_secs(5))
         .max_send_event_attempts(2)
         .send_event_retry_interval(Duration::from_millis(1))
         .build()
         .expect("options should build");
     let processor = EventProcessor::new(&options);
+    let large_json = format!(r#"{{"payload":"{}"}}"#, "x".repeat(512 * 1024));
 
-    assert!(processor.record_metric(&test_user(), "transport-retry", 7.0));
+    assert!(processor.record_evaluation(
+        &test_user(),
+        &FbEvaluationEvent::new("transport-retry", "variation-id", &large_json, false)
+    ));
     assert!(processor.flush_and_wait(Duration::from_secs(2)));
     processor.close();
     server.join().expect("event server should stop");
@@ -589,4 +928,9 @@ fn connection_level_delivery_failure_retries_the_unchanged_batch() {
         .recv_timeout(Duration::from_secs(1))
         .expect("retried request body should be captured");
     assert_eq!(first, retry);
+    let batch: Value = serde_json::from_slice(&retry).expect("retry body should be JSON");
+    assert_eq!(
+        batch[0]["variations"][0]["variation"]["value"].as_str(),
+        Some(large_json.as_str())
+    );
 }

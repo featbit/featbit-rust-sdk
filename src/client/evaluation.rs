@@ -1,6 +1,6 @@
 use std::time::SystemTime;
 
-use crate::evaluation::{EvalError, EvalResult, EvaluationReason, Evaluator};
+use crate::evaluation::{EvalError, EvalReason, EvalResult, EvaluationReason, Evaluator};
 use crate::events::FbEvaluationEvent;
 use crate::model::FbUser;
 use crate::observation::{
@@ -17,8 +17,21 @@ use super::{EvaluationDetail, FbClient, ReasonKind};
 /// call [`FbClient::complete_raw_evaluation`] after conversion succeeds.
 #[derive(Clone, Debug)]
 pub struct RawEvaluation {
-    result: EvalResult,
+    flag_id: String,
+    flag_type: String,
+    reason: EvaluationReason,
     event: FbEvaluationEvent,
+}
+
+#[derive(Clone, Copy)]
+struct SuccessfulEvaluation<'a> {
+    timestamp: SystemTime,
+    key: &'a str,
+    context_key: &'a str,
+    variation_id: &'a str,
+    variation_value: &'a str,
+    reason: EvaluationObservationReason,
+    send_to_experiment: bool,
 }
 
 impl RawEvaluation {
@@ -31,31 +44,31 @@ impl RawEvaluation {
     /// Returns the internal `FeatBit` flag ID.
     #[must_use]
     pub fn flag_id(&self) -> &str {
-        &self.result.flag_id
+        &self.flag_id
     }
 
     /// Returns the `FeatBit` variation type recorded with the flag.
     #[must_use]
     pub fn flag_type(&self) -> &str {
-        &self.result.flag_type
+        &self.flag_type
     }
 
     /// Returns the selected variation ID.
     #[must_use]
     pub fn variation_id(&self) -> &str {
-        &self.result.variation.id
+        self.event.variation_id()
     }
 
     /// Returns the selected variation's unconverted string value.
     #[must_use]
     pub fn value(&self) -> &str {
-        &self.result.variation.value
+        self.event.variation_value()
     }
 
     /// Returns why `FeatBit` selected the variation.
     #[must_use]
     pub const fn reason(&self) -> &EvaluationReason {
-        &self.result.reason
+        &self.reason
     }
 
     /// Returns the immutable event snapshot captured with this evaluation.
@@ -87,7 +100,7 @@ impl FbClient {
     /// Evaluates a boolean flag, returning `default` on every failure.
     #[must_use]
     pub fn bool_variation(&self, key: &str, user: &FbUser, default: bool) -> bool {
-        self.bool_variation_detail(key, user, default).value
+        self.evaluate_typed_value(key, user, || default, parse_bool)
     }
 
     /// Evaluates a boolean flag with diagnostics.
@@ -98,13 +111,13 @@ impl FbClient {
         user: &FbUser,
         default: bool,
     ) -> EvaluationDetail<bool> {
-        self.evaluate_typed(key, user, default, parse_bool)
+        self.evaluate_typed_detail(key, user, || default, parse_bool)
     }
 
     /// Evaluates a signed 64-bit integer flag, returning `default` on every failure.
     #[must_use]
     pub fn int_variation(&self, key: &str, user: &FbUser, default: i64) -> i64 {
-        self.int_variation_detail(key, user, default).value
+        self.evaluate_typed_value(key, user, || default, parse_int)
     }
 
     /// Evaluates a signed 64-bit integer flag with diagnostics.
@@ -115,17 +128,13 @@ impl FbClient {
         user: &FbUser,
         default: i64,
     ) -> EvaluationDetail<i64> {
-        self.evaluate_typed(key, user, default, |value| {
-            value
-                .parse()
-                .map_err(|_| EvaluationObservationError::TypeMismatch)
-        })
+        self.evaluate_typed_detail(key, user, || default, parse_int)
     }
 
     /// Evaluates a 64-bit floating-point flag, returning `default` on every failure.
     #[must_use]
     pub fn float_variation(&self, key: &str, user: &FbUser, default: f64) -> f64 {
-        self.float_variation_detail(key, user, default).value
+        self.evaluate_typed_value(key, user, || default, parse_float)
     }
 
     /// Evaluates a 64-bit floating-point flag with diagnostics.
@@ -136,19 +145,18 @@ impl FbClient {
         user: &FbUser,
         default: f64,
     ) -> EvaluationDetail<f64> {
-        self.evaluate_typed(key, user, default, |value| {
-            value
-                .parse::<f64>()
-                .ok()
-                .filter(|number| number.is_finite())
-                .ok_or(EvaluationObservationError::TypeMismatch)
-        })
+        self.evaluate_typed_detail(key, user, || default, parse_float)
     }
 
     /// Evaluates a string flag, returning `default` on every failure.
     #[must_use]
     pub fn string_variation(&self, key: &str, user: &FbUser, default: &str) -> String {
-        self.string_variation_detail(key, user, default).value
+        self.evaluate_typed_value(
+            key,
+            user,
+            || default.to_owned(),
+            |value| Ok(value.to_owned()),
+        )
     }
 
     /// Evaluates a string flag with diagnostics.
@@ -159,7 +167,12 @@ impl FbClient {
         user: &FbUser,
         default: &str,
     ) -> EvaluationDetail<String> {
-        self.evaluate_typed(key, user, default.to_owned(), |value| Ok(value.to_owned()))
+        self.evaluate_typed_detail(
+            key,
+            user,
+            || default.to_owned(),
+            |value| Ok(value.to_owned()),
+        )
     }
 
     /// Evaluates a JSON flag, returning `default` on every failure.
@@ -170,7 +183,7 @@ impl FbClient {
         user: &FbUser,
         default: serde_json::Value,
     ) -> serde_json::Value {
-        self.json_variation_detail(key, user, default).value
+        self.evaluate_typed_value(key, user, || default, parse_json)
     }
 
     /// Evaluates a JSON flag with diagnostics.
@@ -181,9 +194,7 @@ impl FbClient {
         user: &FbUser,
         default: serde_json::Value,
     ) -> EvaluationDetail<serde_json::Value> {
-        self.evaluate_typed(key, user, default, |value| {
-            serde_json::from_str(value).map_err(|_| EvaluationObservationError::ParseError)
-        })
+        self.evaluate_typed_detail(key, user, || default, parse_json)
     }
 
     /// Evaluates every currently known, non-archived flag as its raw string variation.
@@ -199,7 +210,7 @@ impl FbClient {
             .flags
             .iter()
             .filter(|(_, flag)| !flag.is_archived)
-            .map(|(key, _)| key.as_str())
+            .map(|(key, _)| key.as_ref())
             .collect();
         keys.sort_unstable();
         keys.into_iter()
@@ -211,52 +222,82 @@ impl FbClient {
             .collect()
     }
 
-    fn evaluate_typed<T>(
+    fn evaluate_typed_value<T>(
         &self,
         key: &str,
         user: &FbUser,
-        default: T,
+        default: impl FnOnce() -> T,
+        converter: impl FnOnce(&str) -> Result<T, EvaluationObservationError>,
+    ) -> T {
+        let evaluated = self.evaluate_and_then(key, user, |result| {
+            let timestamp = self
+                .should_complete_value_evaluation()
+                .then(SystemTime::now);
+            let value = converter(&result.variation.value)?;
+            let observation = timestamp
+                .and_then(|timestamp| self.complete_evaluation(user, key, result, timestamp));
+            Ok((value, observation))
+        });
+
+        match evaluated {
+            Ok(Ok((value, observation))) => {
+                self.notify_successful_evaluation(observation);
+                value
+            }
+            Ok(Err(error)) => {
+                self.observe_evaluation_error(key, Some(user.key()), error);
+                default()
+            }
+            Err(_) => default(),
+        }
+    }
+
+    fn evaluate_typed_detail<T>(
+        &self,
+        key: &str,
+        user: &FbUser,
+        default: impl FnOnce() -> T,
         converter: impl FnOnce(&str) -> Result<T, EvaluationObservationError>,
     ) -> EvaluationDetail<T> {
-        match self.evaluate_raw(key, user) {
-            Ok(evaluation) => {
-                let (kind, reason) = reason_detail(evaluation.reason());
-                match converter(evaluation.value()) {
-                    Ok(value) => {
-                        self.complete_raw_evaluation(user, &evaluation);
-                        EvaluationDetail {
-                            key: key.to_owned(),
-                            kind,
-                            reason,
-                            value,
-                            variation_id: evaluation.result.variation.id,
-                            evaluation_event: Some(evaluation.event),
-                        }
-                    }
-                    Err(error) => {
-                        self.observe_evaluation_error(key, Some(user.key()), error);
-                        let (kind, reason) = match error {
-                            EvaluationObservationError::ParseError => {
-                                (ReasonKind::Error, "parse error")
-                            }
-                            _ => (ReasonKind::WrongType, "type mismatch"),
-                        };
-                        EvaluationDetail::fallback(key, kind, reason, default)
-                    }
+        let evaluated = self.evaluate_and_then(key, user, |result| {
+            let timestamp = SystemTime::now();
+            let value = converter(&result.variation.value)?;
+            let (kind, reason) = reason_detail(result.reason);
+            let event = FbEvaluationEvent::at(
+                key,
+                result.variation.id.as_str(),
+                result.variation.value.as_str(),
+                timestamp,
+                result.send_to_experiment,
+            );
+            Ok((
+                EvaluationDetail {
+                    key: key.to_owned(),
+                    kind,
+                    reason,
+                    value,
+                    variation_id: result.variation.id.clone(),
+                    evaluation_event: Some(event),
+                },
+                observation_reason_borrowed(result.reason),
+            ))
+        });
+
+        match evaluated {
+            Ok(Ok((detail, observation_reason))) => {
+                if let Some(event) = &detail.evaluation_event {
+                    self.complete_captured_evaluation(user, event, observation_reason);
                 }
+                detail
+            }
+            Ok(Err(error)) => {
+                self.observe_evaluation_error(key, Some(user.key()), error);
+                let (kind, reason) = conversion_failure_detail(error);
+                EvaluationDetail::fallback(key, kind, reason, default())
             }
             Err(error) => {
-                let (kind, reason) = match error {
-                    EvaluationError::ClientNotReady => {
-                        (ReasonKind::ClientNotReady, "client not ready")
-                    }
-                    EvaluationError::TargetingKeyMissing => {
-                        (ReasonKind::Error, "targeting key is missing")
-                    }
-                    EvaluationError::FlagNotFound => (ReasonKind::Error, "flag not found"),
-                    EvaluationError::MalformedFlag => (ReasonKind::Error, "malformed flag"),
-                };
-                EvaluationDetail::fallback(key, kind, reason, default)
+                let (kind, reason) = evaluation_failure_detail(error);
+                EvaluationDetail::fallback(key, kind, reason, default())
             }
         }
     }
@@ -271,6 +312,26 @@ impl FbClient {
     ///
     /// Returns a typed [`EvaluationError`] when the client cannot evaluate the flag.
     pub fn evaluate_raw(&self, key: &str, user: &FbUser) -> Result<RawEvaluation, EvaluationError> {
+        self.evaluate_and_then(key, user, |result| RawEvaluation {
+            flag_id: result.flag_id.to_owned(),
+            flag_type: result.flag_type.to_owned(),
+            reason: result.reason.into_owned(),
+            event: FbEvaluationEvent::at(
+                key,
+                result.variation.id.as_str(),
+                result.variation.value.as_str(),
+                SystemTime::now(),
+                result.send_to_experiment,
+            ),
+        })
+    }
+
+    fn evaluate_and_then<R>(
+        &self,
+        key: &str,
+        user: &FbUser,
+        use_result: impl for<'snapshot> FnOnce(EvalResult<'snapshot>) -> R,
+    ) -> Result<R, EvaluationError> {
         if !self.evaluation_available() {
             self.observe_evaluation_error(
                 key,
@@ -292,13 +353,7 @@ impl FbClient {
                 return Err(evaluation_error);
             }
         };
-        let event = FbEvaluationEvent::new(
-            key,
-            &result.variation.id,
-            &result.variation.value,
-            result.send_to_experiment,
-        );
-        Ok(RawEvaluation { result, event })
+        Ok(use_result(result))
     }
 
     /// Records a successful raw evaluation after an integration has converted its value.
@@ -307,25 +362,89 @@ impl FbClient {
     /// variation method. Call it at most once for a raw result; repeated calls can enqueue duplicate
     /// analytics events.
     pub fn complete_raw_evaluation(&self, user: &FbUser, evaluation: &RawEvaluation) {
-        if !self.inner.options.disable_events {
-            let _accepted = self
-                .inner
-                .event_processor
-                .record_evaluation(user, &evaluation.event);
-        }
-        let Some(observer) = &self.inner.options.evaluation_observer else {
-            return;
-        };
-        let observation = EvaluationObservation::success(
-            evaluation.event.timestamp(),
-            evaluation.event.flag_key(),
-            user.key(),
-            evaluation.event.variation_id(),
-            evaluation.event.variation_value(),
-            observation_reason(&evaluation.result.reason),
-            evaluation.event.send_to_experiment(),
+        self.complete_captured_evaluation(
+            user,
+            &evaluation.event,
+            observation_reason(&evaluation.reason),
         );
-        observer.on_evaluation(&observation);
+    }
+
+    fn should_complete_value_evaluation(&self) -> bool {
+        self.inner.options.evaluation_observer.is_some()
+            || (!self.inner.options.disable_events && self.inner.event_processor.is_accepting())
+    }
+
+    fn complete_evaluation(
+        &self,
+        user: &FbUser,
+        key: &str,
+        result: EvalResult<'_>,
+        timestamp: SystemTime,
+    ) -> Option<EvaluationObservation> {
+        if !self.inner.options.disable_events {
+            let _accepted = self.inner.event_processor.record_evaluation_at(
+                user,
+                key,
+                &result.variation.id,
+                &result.variation.value,
+                timestamp,
+                result.send_to_experiment,
+            );
+        }
+        self.successful_evaluation_observation(SuccessfulEvaluation {
+            timestamp,
+            key,
+            context_key: user.key(),
+            variation_id: &result.variation.id,
+            variation_value: &result.variation.value,
+            reason: observation_reason_borrowed(result.reason),
+            send_to_experiment: result.send_to_experiment,
+        })
+    }
+
+    fn complete_captured_evaluation(
+        &self,
+        user: &FbUser,
+        event: &FbEvaluationEvent,
+        reason: EvaluationObservationReason,
+    ) {
+        if !self.inner.options.disable_events {
+            let _accepted = self.inner.event_processor.record_evaluation(user, event);
+        }
+        let observation = self.successful_evaluation_observation(SuccessfulEvaluation {
+            timestamp: event.timestamp(),
+            key: event.flag_key(),
+            context_key: user.key(),
+            variation_id: event.variation_id(),
+            variation_value: event.variation_value(),
+            reason,
+            send_to_experiment: event.send_to_experiment(),
+        });
+        self.notify_successful_evaluation(observation);
+    }
+
+    fn successful_evaluation_observation(
+        &self,
+        evaluation: SuccessfulEvaluation<'_>,
+    ) -> Option<EvaluationObservation> {
+        self.inner.options.evaluation_observer.as_ref()?;
+        Some(EvaluationObservation::success(
+            evaluation.timestamp,
+            evaluation.key,
+            evaluation.context_key,
+            evaluation.variation_id,
+            evaluation.variation_value,
+            evaluation.reason,
+            evaluation.send_to_experiment,
+        ))
+    }
+
+    fn notify_successful_evaluation(&self, observation: Option<EvaluationObservation>) {
+        if let (Some(observer), Some(observation)) =
+            (&self.inner.options.evaluation_observer, observation)
+        {
+            observer.on_evaluation(&observation);
+        }
     }
 
     /// Reports an integration-side evaluation failure to the configured observer.
@@ -356,14 +475,14 @@ impl From<EvalError> for EvaluationError {
     }
 }
 
-fn string_detail_from_result(key: &str, result: EvalResult) -> EvaluationDetail<String> {
-    let (kind, reason) = reason_detail(&result.reason);
+fn string_detail_from_result(key: &str, result: EvalResult<'_>) -> EvaluationDetail<String> {
+    let (kind, reason) = reason_detail(result.reason);
     EvaluationDetail {
         key: key.to_owned(),
         kind,
         reason,
-        value: result.variation.value,
-        variation_id: result.variation.id,
+        value: result.variation.value.clone(),
+        variation_id: result.variation.id.clone(),
         evaluation_event: None,
     }
 }
@@ -380,6 +499,19 @@ fn observation_reason(reason: &EvaluationReason) -> EvaluationObservationReason 
     }
 }
 
+fn observation_reason_borrowed(reason: EvalReason<'_>) -> EvaluationObservationReason {
+    match reason {
+        EvalReason::Off => EvaluationObservationReason::Disabled,
+        EvalReason::TargetMatch | EvalReason::RuleMatch { split: false, .. } => {
+            EvaluationObservationReason::TargetingMatch
+        }
+        EvalReason::RuleMatch { split: true, .. } | EvalReason::Fallthrough { split: true } => {
+            EvaluationObservationReason::Split
+        }
+        EvalReason::Fallthrough { split: false } => EvaluationObservationReason::Default,
+    }
+}
+
 fn observation_error(error: EvaluationError) -> EvaluationObservationError {
     match error {
         EvaluationError::ClientNotReady => EvaluationObservationError::ProviderNotReady,
@@ -389,17 +521,33 @@ fn observation_error(error: EvaluationError) -> EvaluationObservationError {
     }
 }
 
-fn reason_detail(reason: &EvaluationReason) -> (ReasonKind, String) {
+fn reason_detail(reason: EvalReason<'_>) -> (ReasonKind, String) {
     match reason {
-        EvaluationReason::Off => (ReasonKind::Off, "flag off".to_owned()),
-        EvaluationReason::TargetMatch => (ReasonKind::TargetMatch, "target match".to_owned()),
-        EvaluationReason::RuleMatch { name, .. } => {
-            (ReasonKind::RuleMatch, format!("match rule {name}"))
-        }
-        EvaluationReason::Fallthrough { .. } => (
+        EvalReason::Off => (ReasonKind::Off, "flag off".to_owned()),
+        EvalReason::TargetMatch => (ReasonKind::TargetMatch, "target match".to_owned()),
+        EvalReason::RuleMatch { name, .. } => (ReasonKind::RuleMatch, format!("match rule {name}")),
+        EvalReason::Fallthrough { .. } => (
             ReasonKind::Fallthrough,
             "fall through targets and rules".to_owned(),
         ),
+    }
+}
+
+const fn conversion_failure_detail(
+    error: EvaluationObservationError,
+) -> (ReasonKind, &'static str) {
+    match error {
+        EvaluationObservationError::ParseError => (ReasonKind::Error, "parse error"),
+        _ => (ReasonKind::WrongType, "type mismatch"),
+    }
+}
+
+const fn evaluation_failure_detail(error: EvaluationError) -> (ReasonKind, &'static str) {
+    match error {
+        EvaluationError::ClientNotReady => (ReasonKind::ClientNotReady, "client not ready"),
+        EvaluationError::TargetingKeyMissing => (ReasonKind::Error, "targeting key is missing"),
+        EvaluationError::FlagNotFound => (ReasonKind::Error, "flag not found"),
+        EvaluationError::MalformedFlag => (ReasonKind::Error, "malformed flag"),
     }
 }
 
@@ -413,11 +561,30 @@ fn parse_bool(value: &str) -> Result<bool, EvaluationObservationError> {
     }
 }
 
+fn parse_int(value: &str) -> Result<i64, EvaluationObservationError> {
+    value
+        .parse()
+        .map_err(|_| EvaluationObservationError::TypeMismatch)
+}
+
+fn parse_float(value: &str) -> Result<f64, EvaluationObservationError> {
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|number| number.is_finite())
+        .ok_or(EvaluationObservationError::TypeMismatch)
+}
+
+fn parse_json(value: &str) -> Result<serde_json::Value, EvaluationObservationError> {
+    serde_json::from_str(value).map_err(|_| EvaluationObservationError::ParseError)
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::FbClient;
+    use crate::model::DataSyncEnvelope;
     use crate::{ClientStatus, EvaluationError, EvaluationReason, FbOptions, FbUser, ReasonKind};
 
     const TYPED_BOOTSTRAP: &str = r#"{
@@ -510,6 +677,48 @@ mod tests {
         assert_eq!(mismatch.kind, ReasonKind::WrongType);
         assert_eq!(mismatch.reason, "type mismatch");
         assert!(mismatch.evaluation_event.is_none());
+    }
+
+    #[test]
+    fn large_json_variations_preserve_value_and_retained_event_semantics() {
+        let client = typed_client();
+        let mut envelope = serde_json::from_str::<DataSyncEnvelope>(TYPED_BOOTSTRAP)
+            .expect("typed bootstrap should parse");
+        let large_text = "x".repeat(256 * 1024);
+        let raw_value = serde_json::to_string(&json!({
+            "payload": large_text,
+            "nested": {
+                "enabled": true,
+                "values": [1, 2, 3, 4]
+            }
+        }))
+        .expect("large JSON variation should serialize");
+        let json_flag = envelope
+            .data
+            .feature_flags
+            .iter_mut()
+            .find(|flag| flag.key == "json")
+            .expect("JSON flag should exist");
+        json_flag.variations[0].value.clone_from(&raw_value);
+        client.inner.store.populate(&envelope.data);
+        let user = FbUser::builder("large-json-user").build();
+
+        let value = client.json_variation("json", &user, json!({"fallback": true}));
+        assert_eq!(value["payload"].as_str().map(str::len), Some(256 * 1024));
+        assert_eq!(value["nested"]["enabled"], true);
+
+        let detail = client.json_variation_detail("json", &user, json!({"fallback": true}));
+        assert_eq!(
+            detail.value["payload"].as_str().map(str::len),
+            Some(256 * 1024)
+        );
+        assert_eq!(
+            detail
+                .evaluation_event
+                .as_ref()
+                .map(crate::FbEvaluationEvent::variation_value),
+            Some(raw_value.as_str())
+        );
     }
 
     #[test]

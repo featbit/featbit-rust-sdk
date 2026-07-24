@@ -1,4 +1,5 @@
 use std::fmt;
+use std::mem::size_of;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::Utc;
@@ -33,11 +34,27 @@ impl FbEvaluationEvent {
         variation_value: impl Into<String>,
         send_to_experiment: bool,
     ) -> Self {
+        Self::at(
+            flag_key,
+            variation_id,
+            variation_value,
+            SystemTime::now(),
+            send_to_experiment,
+        )
+    }
+
+    pub(crate) fn at(
+        flag_key: impl Into<String>,
+        variation_id: impl Into<String>,
+        variation_value: impl Into<String>,
+        timestamp: SystemTime,
+        send_to_experiment: bool,
+    ) -> Self {
         Self {
             flag_key: flag_key.into(),
             variation_id: variation_id.into(),
             variation_value: variation_value.into(),
-            timestamp: SystemTime::now(),
+            timestamp,
             send_to_experiment,
         }
     }
@@ -94,17 +111,57 @@ pub(super) enum PayloadEvent {
 }
 
 impl PayloadEvent {
+    pub(super) fn estimated_evaluation_size(
+        user: &FbUser,
+        flag_key: &str,
+        variation_id: &str,
+        variation_value: &str,
+    ) -> usize {
+        estimated_user_size(user)
+            .saturating_add(size_of::<PayloadEvent>())
+            .saturating_add(size_of::<EvaluationVariation>())
+            .saturating_add(flag_key.len())
+            .saturating_add(variation_id.len())
+            .saturating_add(variation_value.len())
+    }
+
+    pub(super) fn estimated_metric_size(user: &FbUser, event_name: &str) -> usize {
+        estimated_user_size(user)
+            .saturating_add(size_of::<PayloadEvent>())
+            .saturating_add(size_of::<Metric>())
+            .saturating_add(event_name.len())
+    }
+
+    #[cfg(test)]
     pub(super) fn evaluation(user: &FbUser, event: &FbEvaluationEvent) -> Self {
+        Self::evaluation_at(
+            user,
+            event.flag_key(),
+            event.variation_id(),
+            event.variation_value(),
+            event.timestamp(),
+            event.send_to_experiment(),
+        )
+    }
+
+    pub(super) fn evaluation_at(
+        user: &FbUser,
+        flag_key: &str,
+        variation_id: &str,
+        variation_value: &str,
+        timestamp: SystemTime,
+        send_to_experiment: bool,
+    ) -> Self {
         Self::Evaluation(EvaluationPayload {
             user: EventUser::from(user),
             variations: vec![EvaluationVariation {
-                feature_flag_key: event.flag_key.clone(),
+                feature_flag_key: flag_key.to_owned(),
                 variation: EventVariation {
-                    id: event.variation_id.clone(),
-                    value: event.variation_value.clone(),
+                    id: variation_id.to_owned(),
+                    value: variation_value.to_owned(),
                 },
-                timestamp: unix_millis(event.timestamp),
-                send_to_experiment: event.send_to_experiment,
+                timestamp: unix_millis(timestamp),
+                send_to_experiment,
             }],
         })
     }
@@ -122,6 +179,88 @@ impl PayloadEvent {
             }],
         })
     }
+
+    #[cfg(test)]
+    pub(super) fn retained_size(&self) -> usize {
+        match self {
+            Self::Evaluation(payload) => retained_user_size(&payload.user)
+                .saturating_add(size_of::<PayloadEvent>())
+                .saturating_add(
+                    payload
+                        .variations
+                        .capacity()
+                        .saturating_mul(size_of::<EvaluationVariation>()),
+                )
+                .saturating_add(
+                    payload
+                        .variations
+                        .iter()
+                        .map(|variation| {
+                            variation
+                                .feature_flag_key
+                                .capacity()
+                                .saturating_add(variation.variation.id.capacity())
+                                .saturating_add(variation.variation.value.capacity())
+                        })
+                        .fold(0, usize::saturating_add),
+                ),
+            Self::Metric(payload) => retained_user_size(&payload.user)
+                .saturating_add(size_of::<PayloadEvent>())
+                .saturating_add(
+                    payload
+                        .metrics
+                        .capacity()
+                        .saturating_mul(size_of::<Metric>()),
+                )
+                .saturating_add(
+                    payload
+                        .metrics
+                        .iter()
+                        .map(|metric| metric.event_name.capacity())
+                        .fold(0, usize::saturating_add),
+                ),
+        }
+    }
+}
+
+fn estimated_user_size(user: &FbUser) -> usize {
+    user.key()
+        .len()
+        .saturating_add(user.name().len())
+        .saturating_add(
+            user.custom()
+                .len()
+                .saturating_mul(size_of::<CustomizedProperty>()),
+        )
+        .saturating_add(
+            user.custom()
+                .iter()
+                .map(|(name, value)| name.len().saturating_add(value.len()))
+                .fold(0, usize::saturating_add),
+        )
+}
+
+#[cfg(test)]
+fn retained_user_size(user: &EventUser) -> usize {
+    user.key_id
+        .capacity()
+        .saturating_add(user.name.capacity())
+        .saturating_add(
+            user.customized_properties
+                .capacity()
+                .saturating_mul(size_of::<CustomizedProperty>()),
+        )
+        .saturating_add(
+            user.customized_properties
+                .iter()
+                .map(|property| {
+                    property
+                        .name
+                        .capacity()
+                        .saturating_add(property.value.capacity())
+                })
+                .fold(0, usize::saturating_add),
+        )
 }
 
 fn unix_millis(timestamp: SystemTime) -> i64 {

@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -407,6 +408,7 @@ async fn close_cancels_a_stalled_websocket_handshake() {
 
     assert!(started.elapsed() < Duration::from_secs(2));
     assert_eq!(status.status(), SyncStatus::Closed);
+    assert!(synchronizer.close_complete.load(Ordering::Acquire));
     assert_eq!(
         synchronizer.worker.wait(Duration::from_secs(1)),
         WorkerWait::Completed

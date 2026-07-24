@@ -15,20 +15,60 @@ pub(super) fn rollout_of_key(key: &str) -> f64 {
 }
 
 pub(super) fn is_in_rollout(key: &str, rollout: &[f64]) -> bool {
-    let [min, max] = rollout else {
-        return false;
-    };
-    if !min.is_finite() || !max.is_finite() || min > max {
-        return false;
+    RolloutMatcher::new(key).matches(rollout)
+}
+
+pub(super) struct RolloutMatcher<'key> {
+    key: &'key str,
+    value: Option<f64>,
+    #[cfg(test)]
+    hash_computations: usize,
+}
+
+impl<'key> RolloutMatcher<'key> {
+    pub(super) const fn new(key: &'key str) -> Self {
+        Self {
+            key,
+            value: None,
+            #[cfg(test)]
+            hash_computations: 0,
+        }
     }
-    if *min == 0.0 && 1.0 - max < 1e-5 {
-        return true;
+
+    pub(super) fn matches(&mut self, rollout: &[f64]) -> bool {
+        let [min, max] = rollout else {
+            return false;
+        };
+        if !min.is_finite() || !max.is_finite() || min > max {
+            return false;
+        }
+        if *min == 0.0 && 1.0 - max < 1e-5 {
+            return true;
+        }
+        if *min == 0.0 && *max == 0.0 {
+            return false;
+        }
+        let value = self.value();
+        value >= *min && value <= *max
     }
-    if *min == 0.0 && *max == 0.0 {
-        return false;
+
+    fn value(&mut self) -> f64 {
+        if let Some(value) = self.value {
+            return value;
+        }
+        let value = rollout_of_key(self.key);
+        self.value = Some(value);
+        #[cfg(test)]
+        {
+            self.hash_computations += 1;
+        }
+        value
     }
-    let value = rollout_of_key(key);
-    value >= *min && value <= *max
+
+    #[cfg(test)]
+    const fn hash_computations(&self) -> usize {
+        self.hash_computations
+    }
 }
 
 pub(super) fn is_percentage_split(variations: &[RolloutVariation]) -> bool {
@@ -42,7 +82,7 @@ pub(super) fn is_percentage_split(variations: &[RolloutVariation]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_in_rollout, rollout_of_key};
+    use super::{is_in_rollout, rollout_of_key, RolloutMatcher};
 
     // Compatibility fixtures copied verbatim from FeatBit .NET Server SDK commit
     // 974e2a7a557095b300e4e89da86df7d6fa894963,
@@ -94,5 +134,21 @@ mod tests {
             "test-value",
             &[exact_boundary, exact_boundary]
         ));
+    }
+
+    #[test]
+    fn rollout_matcher_hashes_lazily_and_only_once_across_ranges() {
+        let mut shortcut_matcher = RolloutMatcher::new("test-value");
+        assert!(!shortcut_matcher.matches(&[]));
+        assert!(!shortcut_matcher.matches(&[0.8, 0.2]));
+        assert!(!shortcut_matcher.matches(&[0.0, 0.0]));
+        assert!(shortcut_matcher.matches(&[0.0, 1.0]));
+        assert_eq!(shortcut_matcher.hash_computations(), 0);
+
+        let mut split_matcher = RolloutMatcher::new("test-value");
+        assert!(!split_matcher.matches(&[0.2, 0.3]));
+        assert!(!split_matcher.matches(&[0.3, 0.4]));
+        assert!(split_matcher.matches(&[0.1, 0.2]));
+        assert_eq!(split_matcher.hash_computations(), 1);
     }
 }

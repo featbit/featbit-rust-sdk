@@ -83,7 +83,7 @@ fn match_segment_ids(
     for segment_id in segment_ids {
         let Some(segment) = snapshot
             .segments
-            .get(segment_id)
+            .get(segment_id.as_str())
             .filter(|segment| !segment.is_archived)
         else {
             return SegmentMatch::Invalid;
@@ -91,7 +91,7 @@ fn match_segment_ids(
         let prepared = snapshot
             .prepared
             .segments
-            .get(segment_id)
+            .get(segment_id.as_str())
             .map(AsRef::as_ref);
         if segment_matches(segment, prepared, user) {
             return SegmentMatch::Matched;

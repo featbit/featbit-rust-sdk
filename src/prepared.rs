@@ -10,8 +10,8 @@ pub(crate) const IS_NOT_IN_SEGMENT: &str = "User is not in segment";
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PreparedSnapshot {
-    pub(crate) flags: HashMap<String, Arc<PreparedFlag>>,
-    pub(crate) segments: HashMap<String, Arc<PreparedSegment>>,
+    pub(crate) flags: Arc<HashMap<Arc<str>, Arc<PreparedFlag>>>,
+    pub(crate) segments: Arc<HashMap<Arc<str>, Arc<PreparedSegment>>>,
 }
 
 #[derive(Clone, Debug, Default)]
