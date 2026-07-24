@@ -1,13 +1,15 @@
 //! Evaluates flags directly through `FbClient` in Axum and closes `FeatBit` gracefully.
+//!
+//! The evaluation endpoint accepts both POST JSON and browser-friendly GET query parameters.
 
 use std::collections::BTreeMap;
 use std::env;
 use std::error::Error;
 
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::get;
 use axum::{Json, Router};
 use featbit_server_sdk::{ClientStatus, FbClient, FbOptions, FbUser};
 use serde::{Deserialize, Serialize};
@@ -34,6 +36,36 @@ struct BooleanEvaluationRequest {
     attributes: BTreeMap<String, String>,
     #[serde(default)]
     default_value: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BooleanEvaluationQuery {
+    #[serde(default = "default_browser_targeting_key")]
+    targeting_key: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    default_value: bool,
+    // Any non-reserved query parameter becomes a FeatBit custom user attribute. For example,
+    // `?country=CN&plan=pro` evaluates with both attributes.
+    #[serde(flatten)]
+    attributes: BTreeMap<String, String>,
+}
+
+impl From<BooleanEvaluationQuery> for BooleanEvaluationRequest {
+    fn from(query: BooleanEvaluationQuery) -> Self {
+        Self {
+            targeting_key: query.targeting_key,
+            name: query.name,
+            attributes: query.attributes,
+            default_value: query.default_value,
+        }
+    }
+}
+
+fn default_browser_targeting_key() -> String {
+    "browser-example-user".to_owned()
 }
 
 #[derive(Debug, Serialize)]
@@ -97,7 +129,10 @@ async fn main() -> Result<(), AnyError> {
 fn routes() -> Router<AppState> {
     Router::new()
         .route("/health/ready", get(readiness))
-        .route("/api/flags/{flag_key}/evaluate", post(evaluate_boolean))
+        .route(
+            "/api/flags/{flag_key}/evaluate",
+            get(evaluate_boolean_get).post(evaluate_boolean_post),
+        )
         .layer(DefaultBodyLimit::max(64 * 1024))
         .layer(TraceLayer::new_for_http())
 }
@@ -121,11 +156,27 @@ async fn readiness(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
-async fn evaluate_boolean(
+async fn evaluate_boolean_get(
+    State(state): State<AppState>,
+    Path(flag_key): Path<String>,
+    Query(query): Query<BooleanEvaluationQuery>,
+) -> Result<Json<BooleanEvaluationResponse>, ApiError> {
+    evaluate_boolean_request(&state, flag_key, query.into())
+}
+
+async fn evaluate_boolean_post(
     State(state): State<AppState>,
     Path(flag_key): Path<String>,
     // Body extractors belong last because they consume the request body.
     Json(request): Json<BooleanEvaluationRequest>,
+) -> Result<Json<BooleanEvaluationResponse>, ApiError> {
+    evaluate_boolean_request(&state, flag_key, request)
+}
+
+fn evaluate_boolean_request(
+    state: &AppState,
+    flag_key: String,
+    request: BooleanEvaluationRequest,
 ) -> Result<Json<BooleanEvaluationResponse>, ApiError> {
     if request.targeting_key.trim().is_empty() {
         return Err(ApiError::invalid_targeting_key());
@@ -217,4 +268,38 @@ async fn shutdown_signal() {
         () = terminate => {}
     }
     tracing::info!("shutdown signal received; draining HTTP requests");
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::http::Uri;
+
+    use super::*;
+
+    #[test]
+    fn get_query_uses_browser_safe_defaults() {
+        let uri = Uri::from_static("/api/flags/example-flag/evaluate");
+        let Query(query) =
+            Query::<BooleanEvaluationQuery>::try_from_uri(&uri).expect("query should deserialize");
+
+        assert_eq!(query.targeting_key, "browser-example-user");
+        assert!(query.name.is_empty());
+        assert!(!query.default_value);
+        assert!(query.attributes.is_empty());
+    }
+
+    #[test]
+    fn get_query_maps_extra_parameters_to_custom_attributes() {
+        let uri = Uri::from_static(
+            "/api/flags/example-flag/evaluate?targetingKey=user-42&name=Browser%20User&defaultValue=true&country=CN&plan=pro",
+        );
+        let Query(query) =
+            Query::<BooleanEvaluationQuery>::try_from_uri(&uri).expect("query should deserialize");
+
+        assert_eq!(query.targeting_key, "user-42");
+        assert_eq!(query.name, "Browser User");
+        assert!(query.default_value);
+        assert_eq!(query.attributes.get("country"), Some(&"CN".to_owned()));
+        assert_eq!(query.attributes.get("plan"), Some(&"pro".to_owned()));
+    }
 }
