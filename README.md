@@ -33,7 +33,7 @@ Add the current SDK version and a logger implementation to `Cargo.toml`:
 
 ```toml
 [dependencies]
-featbit-server-sdk = "0.1.0-beta.2"
+featbit-server-sdk = "0.1.1"
 env_logger = "0.11"
 ```
 
@@ -90,7 +90,18 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
   `cargo run --example fbclient_axum`
 
 The Axum example creates one client during startup, shares cloneable handles through application
-state, exposes `GET /health/ready`, drains in-flight requests, and then closes the SDK.
+state, drains in-flight requests, and then closes the SDK. It exposes:
+
+- `GET /health/ready` for readiness checks;
+- `GET /api/flags/{flag_key}/evaluate` for browser-friendly evaluation with query parameters;
+- `POST /api/flags/{flag_key}/evaluate` for JSON request bodies.
+
+For GET evaluation, `targetingKey`, `name`, and `defaultValue` are reserved parameters. Every other
+query parameter becomes a custom user attribute:
+
+```text
+http://127.0.0.1:3000/api/flags/example-flag/evaluate?targetingKey=user-123&country=CN&plan=pro&defaultValue=false
+```
 
 ## SDK
 
