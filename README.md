@@ -281,7 +281,7 @@ use featbit_server_sdk::{FbClient, FbOptions};
 let bootstrap = std::fs::read_to_string("featbit-bootstrap.json")?;
 let options = FbOptions::builder("offline-placeholder")
     .offline(true)
-    .disable_events(true, false)
+    .disable_events(false, false)
     .bootstrap_json(bootstrap)
     .build()?;
 let client = FbClient::with_options(options);
