@@ -98,7 +98,7 @@ async fn assert_full_and_patch_over_websocket(reply_to_ping: bool) {
 
     let options = FbOptionsBuilder::new("valid-environment-secret")
         .streaming_url(format!("ws://{address}"))
-        .disable_events(true, false)
+        .disable_events(true)
         .start_wait(Duration::from_secs(2))
         .connect_timeout(Duration::from_secs(1))
         .close_timeout(Duration::from_secs(1))
@@ -230,7 +230,7 @@ async fn websocket_handshake_rejection_retries_and_recovers() {
 
     let options = FbOptionsBuilder::new("valid-environment-secret")
         .streaming_url(format!("ws://{address}"))
-        .disable_events(true, false)
+        .disable_events(true)
         .start_wait(Duration::from_secs(2))
         .connect_timeout(Duration::from_secs(1))
         .close_timeout(Duration::from_secs(1))
@@ -280,7 +280,7 @@ async fn initial_sync_uses_the_version_of_a_prepopulated_store() {
     let status = Arc::new(StatusTracker::new(SyncStatus::Starting, true));
     let options = FbOptionsBuilder::new("valid-environment-secret")
         .streaming_url(format!("ws://{address}"))
-        .disable_events(true, false)
+        .disable_events(true)
         .start_wait(Duration::from_secs(2))
         .connect_timeout(Duration::from_secs(1))
         .close_timeout(Duration::from_secs(1))
@@ -357,7 +357,7 @@ async fn equal_version_conflict_requests_an_authoritative_full_snapshot() {
 
     let options = FbOptionsBuilder::new("valid-environment-secret")
         .streaming_url(format!("ws://{address}"))
-        .disable_events(true, false)
+        .disable_events(true)
         .start_wait(Duration::from_secs(2))
         .connect_timeout(Duration::from_secs(1))
         .close_timeout(Duration::from_secs(1))
@@ -408,7 +408,7 @@ async fn close_cancels_a_stalled_websocket_handshake() {
         .expect("listener should have an address");
     let options = FbOptionsBuilder::new("valid-environment-secret")
         .streaming_url(format!("ws://{address}"))
-        .disable_events(true, false)
+        .disable_events(true)
         .start_wait(Duration::from_secs(30))
         .connect_timeout(Duration::from_secs(30))
         .close_timeout(Duration::from_millis(400))
@@ -485,7 +485,7 @@ async fn unrecoverable_close_is_terminal_and_disables_stale_evaluation() {
 
     let options = FbOptionsBuilder::new("valid-environment-secret")
         .streaming_url(format!("ws://{address}"))
-        .disable_events(true, false)
+        .disable_events(true)
         .start_wait(Duration::from_secs(2))
         .connect_timeout(Duration::from_secs(1))
         .close_timeout(Duration::from_secs(1))
@@ -557,7 +557,7 @@ async fn websocket_handshake_contains_protocol_path_query_and_user_agent() {
 
     let options = FbOptionsBuilder::new("valid-environment-secret")
         .streaming_url(format!("ws://{address}/proxy/"))
-        .disable_events(true, false)
+        .disable_events(true)
         .start_wait(Duration::from_secs(1))
         .connect_timeout(Duration::from_millis(200))
         .close_timeout(Duration::from_secs(1))
@@ -598,7 +598,7 @@ async fn configured_connect_timeout_retries_a_stalled_handshake() {
 
     let options = FbOptionsBuilder::new("valid-environment-secret")
         .streaming_url(format!("ws://{address}"))
-        .disable_events(true, false)
+        .disable_events(true)
         .start_wait(Duration::from_millis(200))
         .connect_timeout(Duration::from_millis(50))
         .close_timeout(Duration::from_millis(200))
@@ -647,7 +647,7 @@ async fn unrecoverable_close_before_initialization_stops_without_becoming_ready(
 
     let options = FbOptionsBuilder::new("valid-environment-secret")
         .streaming_url(format!("ws://{address}"))
-        .disable_events(true, false)
+        .disable_events(true)
         .start_wait(Duration::from_secs(1))
         .connect_timeout(Duration::from_millis(200))
         .close_timeout(Duration::from_secs(1))
@@ -713,7 +713,7 @@ async fn disconnected_ready_client_becomes_stale_and_evaluates_cached_data() {
 
     let options = FbOptionsBuilder::new("valid-environment-secret")
         .streaming_url(format!("ws://{address}"))
-        .disable_events(true, false)
+        .disable_events(true)
         .start_wait(Duration::from_secs(1))
         .connect_timeout(Duration::from_millis(200))
         .close_timeout(Duration::from_secs(1))

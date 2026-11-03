@@ -88,7 +88,7 @@ fn public_client_is_send_and_sync() {
 fn documented_offline_bootstrap_evaluates_without_network() {
     let options = FbOptionsBuilder::new("offline-placeholder")
         .offline(true)
-        .disable_events(true, false)
+        .disable_events(true)
         .bootstrap_json(DOCUMENTED_BOOTSTRAP)
         .build()
         .expect("documented bootstrap should build");
@@ -127,7 +127,7 @@ fn explicit_tracking_remains_available_while_initial_sync_is_pending() {
         .connect_timeout(Duration::from_millis(1))
         .close_timeout(Duration::from_millis(200))
         .auto_flush_interval(Duration::from_mins(1))
-        .disable_events(true, true)
+        .disable_events(false)
         .build()
         .expect("options should build");
     let client = FbClient::with_options(options);
@@ -182,7 +182,7 @@ fn explicit_tracking_remains_available_while_initial_sync_is_pending() {
 fn evaluation_and_idempotent_close_are_thread_safe() {
     let options = FbOptionsBuilder::new("valid-secret")
         .offline(true)
-        .disable_events(true, false)
+        .disable_events(true)
         .bootstrap_json(READY_BOOTSTRAP)
         .build()
         .expect("offline options should build");
@@ -232,7 +232,7 @@ fn evaluation_and_idempotent_close_are_thread_safe() {
 fn terminal_sync_status_never_evaluates_a_previously_ready_snapshot() {
     let options = FbOptionsBuilder::new("valid-secret")
         .offline(true)
-        .disable_events(true, false)
+        .disable_events(true)
         .bootstrap_json(READY_BOOTSTRAP)
         .build()
         .expect("offline options should build");
@@ -303,7 +303,7 @@ fn retained_evaluation_event_survives_a_newer_flag_snapshot() {
         .start_wait(Duration::from_millis(2))
         .connect_timeout(Duration::from_millis(1))
         .auto_flush_interval(Duration::from_mins(1))
-        .disable_events(true, true)
+        .disable_events(false)
         .build()
         .expect("online options should build");
     let client = FbClient::with_options(options);
@@ -336,19 +336,15 @@ fn retained_evaluation_event_survives_a_newer_flag_snapshot() {
         .expect("retained event should be delivered");
     let batch: serde_json::Value =
         serde_json::from_slice(&body).expect("event batch should be JSON");
-    let variation = &batch[0]["variations"][0]["variation"];
+    assert_eq!(batch.as_array().unwrap().len(), 3);
+    let variation = &batch[2]["variations"][0]["variation"];
     assert_eq!(variation["id"], "value");
     assert_eq!(variation["value"], "true");
 }
 
 #[test]
 fn event_modes_control_automatic_and_explicit_delivery() {
-    for (disable, allow_track, expected_evaluations, expected_metrics) in [
-        (false, true, 3, 1),
-        (false, false, 2, 0),
-        (true, true, 1, 1),
-        (true, false, 0, 0),
-    ] {
+    for (disable, expected_evaluations, expected_metrics) in [(false, 3, 1), (true, 0, 0)] {
         let expected_total = expected_evaluations + expected_metrics;
         let statuses = if expected_total == 0 {
             Vec::new()
@@ -364,7 +360,7 @@ fn event_modes_control_automatic_and_explicit_delivery() {
             .close_timeout(Duration::from_millis(200))
             .auto_flush_interval(Duration::from_mins(1))
             .flush_timeout(Duration::from_secs(2))
-            .disable_events(disable, allow_track)
+            .disable_events(disable)
             .build()
             .expect("online options should build");
         let client = FbClient::with_options(options);
@@ -381,17 +377,11 @@ fn event_modes_control_automatic_and_explicit_delivery() {
             .evaluation_event
             .as_ref()
             .expect("successful detail should retain its evaluation event");
-        assert_eq!(
-            client.track_eval_event(&user, evaluation_event),
-            allow_track
-        );
-        assert_eq!(
-            client.track_metric_event(&user, "converted", 1.0),
-            allow_track
-        );
+        assert_eq!(client.track_eval_event(&user, evaluation_event), !disable);
+        assert_eq!(client.track_metric_event(&user, "converted", 1.0), !disable);
         assert_eq!(
             matches!(&client.inner.event_processor, EventProcessor::Disabled),
-            disable && !allow_track
+            disable
         );
         assert!(client.flush_and_wait(Duration::from_secs(2)));
         client.close();
@@ -431,7 +421,7 @@ fn observer_is_independent_from_featbit_event_delivery() {
     let observations = Arc::clone(&observer.observations);
     let options = FbOptionsBuilder::new("valid-secret")
         .offline(true)
-        .disable_events(true, false)
+        .disable_events(true)
         .evaluation_observer(observer)
         .bootstrap_json(READY_BOOTSTRAP)
         .build()

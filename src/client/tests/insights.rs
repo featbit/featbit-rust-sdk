@@ -16,7 +16,7 @@ fn data(setting: Option<&Value>, version: i64) -> DataSet {
         .data
 }
 
-fn client(url: &str, disable: bool, allow: bool, observer: RecordingObserver) -> FbClient {
+fn client(url: &str, disable: bool, observer: RecordingObserver) -> FbClient {
     let options = FbOptionsBuilder::new("valid-secret")
         .streaming_url("ws://127.0.0.1:9")
         .event_url(url)
@@ -25,7 +25,7 @@ fn client(url: &str, disable: bool, allow: bool, observer: RecordingObserver) ->
         .close_timeout(Duration::from_millis(200))
         .auto_flush_interval(Duration::from_mins(1))
         .max_events_per_request(50)
-        .disable_events(disable, allow)
+        .disable_events(disable)
         .evaluation_observer(observer)
         .build()
         .unwrap();
@@ -45,28 +45,29 @@ fn insights_all_entry_points_respect_global_modes_and_preserve_observers() {
         Some(json!("false")),
     ] {
         let enabled = setting != Some(json!(false));
-        for (disable, allow) in [(false, true), (false, false), (true, true), (true, false)] {
+        for disable in [false, true] {
             let mut server = mockito::Server::new();
             let automatic = usize::from(enabled && !disable) * 11;
-            let explicit = usize::from(enabled && allow) * 2;
-            let count = automatic + explicit + usize::from(allow);
+            let explicit = usize::from(enabled && !disable) * 2;
+            let count = automatic + explicit + usize::from(!disable);
             let request = server.mock("POST", "/api/public/insight/track");
             // Check the actual batch size and that internal eligibility never leaks on the wire.
             let request = request
                 .match_request(move |request| {
                     let body: Value = serde_json::from_slice(request.body().unwrap()).unwrap();
-                    body.as_array().is_some_and(|events| events.len() == count)
-                        && !request
-                            .body()
-                            .unwrap()
-                            .windows(b"insightsEnabled".len())
-                            .any(|w| w == b"insightsEnabled")
+                    count == 0
+                        || (body.as_array().is_some_and(|events| events.len() == count)
+                            && !request
+                                .body()
+                                .unwrap()
+                                .windows(b"insightsEnabled".len())
+                                .any(|w| w == b"insightsEnabled"))
                 })
                 .with_status(202)
                 .expect(usize::from(count > 0))
                 .create();
             let observer = RecordingObserver::default();
-            let client = client(&server.url(), disable, allow, observer.clone());
+            let client = client(&server.url(), disable, observer.clone());
             let mut dataset = data(setting.as_ref(), 1);
             for (key, value) in [("number", "42"), ("json", "{}"), ("string", "hello")] {
                 let mut flag = dataset.feature_flags[0].clone();
@@ -102,12 +103,12 @@ fn insights_all_entry_points_respect_global_modes_and_preserve_observers() {
             client.complete_raw_evaluation(&user, &raw);
             let event = detail.evaluation_event.unwrap();
             assert_eq!(event.insights_enabled(), enabled);
-            assert_eq!(client.track_eval_event(&user, &event), enabled && allow);
+            assert_eq!(client.track_eval_event(&user, &event), enabled && !disable);
             assert_eq!(
                 client.track_eval_event_for_flag(&user, "enabled"),
-                enabled && allow
+                enabled && !disable
             );
-            assert_eq!(client.track_metric_event(&user, "purchase", 1.0), allow);
+            assert_eq!(client.track_metric_event(&user, "purchase", 1.0), !disable);
             assert!(client
                 .all_variations(&user)
                 .iter()
@@ -129,8 +130,17 @@ fn insights_all_entry_points_respect_global_modes_and_preserve_observers() {
 #[test]
 fn insights_captured_detail_and_raw_survive_patch_in_both_directions() {
     for disable in [false, true] {
-        let (url, bodies, server) = scripted_http_server([202]);
-        let client = client(&url, disable, true, RecordingObserver::default());
+        let mut server = mockito::Server::new();
+        let request = server
+            .mock("POST", "/api/public/insight/track")
+            .match_request(move |request| {
+                let body: Value = serde_json::from_slice(request.body().unwrap()).unwrap();
+                disable || body.as_array().is_some_and(|events| events.len() == 4)
+            })
+            .with_status(202)
+            .expect(usize::from(!disable))
+            .create();
+        let client = client(&server.url(), disable, RecordingObserver::default());
         client.inner.store.populate(&data(Some(&json!(true)), 1));
         let user = FbUser::builder("user").build();
         let enabled = client.bool_variation_detail("enabled", &user, false);
@@ -142,7 +152,10 @@ fn insights_captured_detail_and_raw_survive_patch_in_both_directions() {
         let disabled = client.bool_variation_detail("enabled", &user, false);
         let raw_disabled = client.evaluate_raw("enabled", &user).unwrap();
         assert_eq!(enabled, disabled);
-        assert!(client.track_eval_event(&user, enabled.evaluation_event.as_ref().unwrap()));
+        assert_eq!(
+            client.track_eval_event(&user, enabled.evaluation_event.as_ref().unwrap()),
+            !disable
+        );
         client.complete_raw_evaluation(&user, &raw_enabled);
         assert_eq!(
             client.inner.store.patch(&data(Some(&json!(true)), 3)),
@@ -150,13 +163,10 @@ fn insights_captured_detail_and_raw_survive_patch_in_both_directions() {
         );
         assert!(!client.track_eval_event(&user, disabled.evaluation_event.as_ref().unwrap()));
         client.complete_raw_evaluation(&user, &raw_disabled);
-        assert!(client.track_eval_event_for_flag(&user, "enabled"));
+        assert_eq!(client.track_eval_event_for_flag(&user, "enabled"), !disable);
         assert!(client.flush_and_wait(Duration::from_secs(2)));
         client.close();
-        server.join().unwrap();
-        let body: Value =
-            serde_json::from_slice(&bodies.recv_timeout(Duration::from_secs(1)).unwrap()).unwrap();
-        assert_eq!(body.as_array().unwrap().len(), if disable { 2 } else { 4 });
+        request.assert();
     }
 }
 

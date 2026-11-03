@@ -281,7 +281,6 @@ use featbit_server_sdk::{FbClient, FbOptions};
 let bootstrap = std::fs::read_to_string("featbit-bootstrap.json")?;
 let options = FbOptions::builder("offline-placeholder")
     .offline(true)
-    .disable_events(false, false)
     .bootstrap_json(bootstrap)
     .build()?;
 let client = FbClient::with_options(options);
@@ -296,22 +295,20 @@ not poll for updates; unknown flags continue to resolve to fallbacks.
 
 ### Disable Events Collection
 
-`disable_events(disable, allow_track)` controls automatic evaluation analytics and explicit
-tracking independently:
+Events are enabled by default. Set `.disable_events(true)` on the options builder to stop all
+FeatBit event collection and delivery, including automatic evaluation events, explicit evaluation
+tracking, and custom metrics. Tracking methods return `false`, and no event worker is started.
+Flag synchronization, local evaluation, and OpenTelemetry observers continue to work.
 
-| Configuration | Automatic evaluation events | Explicit evaluation/metric tracking |
-| --- | --- | --- |
-| `disable_events(false, true)` (default) | enabled | allowed |
-| `disable_events(false, false)` | enabled | rejected |
-| `disable_events(true, true)` | disabled | allowed |
-| `disable_events(true, false)` | disabled | rejected; no event worker |
-
-For application-controlled exposure tracking, `disable_events(true, true)` is recommended.
+A flag with `insightsEnabled: false` suppresses only its evaluation events; custom metrics remain
+available when global events are enabled.
 
 ### Experiments (A/B/n Testing)
 
 Successful detail evaluations retain an immutable event snapshot. This lets the application record
-the exact variation only after a real exposure, even if the flag changes in the meantime:
+the exact variation after a real exposure, even if the flag changes in the meantime.
+Detail evaluations already record an automatic event when enabled; explicitly tracking their
+snapshot records an additional event:
 
 ```rust,no_run
 use featbit_server_sdk::{FbClient, FbUser};

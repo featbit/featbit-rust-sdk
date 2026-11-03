@@ -46,7 +46,7 @@ pub(crate) enum EventProcessor {
 
 impl EventProcessor {
     pub(crate) fn new(options: &FbOptions) -> Self {
-        if options.offline || (options.disable_events && !options.allow_track) {
+        if options.offline || options.disable_events {
             return Self::Disabled;
         }
 

@@ -44,7 +44,6 @@ pub struct FbOptions {
     pub(crate) start_wait: Duration,
     pub(crate) offline: bool,
     pub(crate) disable_events: bool,
-    pub(crate) allow_track: bool,
     pub(crate) evaluation_observer: Option<Arc<dyn EvaluationObserver>>,
     pub(crate) connect_timeout: Duration,
     pub(crate) close_timeout: Duration,
@@ -93,16 +92,18 @@ impl FbOptions {
         self.offline
     }
 
-    /// Returns whether automatic evaluation-event collection is disabled.
+    /// Returns whether all evaluation and metric event collection is disabled.
     #[must_use]
     pub const fn events_disabled(&self) -> bool {
         self.disable_events
     }
 
-    /// Returns whether explicit evaluation and metric tracking calls are allowed.
+    /// Returns whether the event configuration allows explicit evaluation and metric tracking.
+    ///
+    /// Offline mode, shutdown, flag insights settings, and queue capacity can still prevent tracking.
     #[must_use]
     pub const fn track_allowed(&self) -> bool {
-        self.allow_track
+        !self.disable_events
     }
 }
 impl fmt::Debug for FbOptions {
@@ -115,7 +116,6 @@ impl fmt::Debug for FbOptions {
             .field("start_wait", &self.start_wait)
             .field("offline", &self.offline)
             .field("disable_events", &self.disable_events)
-            .field("allow_track", &self.allow_track)
             .field(
                 "has_evaluation_observer",
                 &self.evaluation_observer.is_some(),
@@ -150,7 +150,6 @@ pub struct FbOptionsBuilder {
     start_wait: Duration,
     offline: bool,
     disable_events: bool,
-    allow_track: bool,
     evaluation_observer: Option<Arc<dyn EvaluationObserver>>,
     connect_timeout: Duration,
     close_timeout: Duration,
@@ -178,7 +177,6 @@ impl fmt::Debug for FbOptionsBuilder {
             .field("start_wait", &self.start_wait)
             .field("offline", &self.offline)
             .field("disable_events", &self.disable_events)
-            .field("allow_track", &self.allow_track)
             .field(
                 "has_evaluation_observer",
                 &self.evaluation_observer.is_some(),
@@ -215,7 +213,6 @@ impl FbOptionsBuilder {
             start_wait: Duration::from_secs(5),
             offline: false,
             disable_events: false,
-            allow_track: true,
             evaluation_observer: None,
             connect_timeout: Duration::from_secs(3),
             close_timeout: Duration::from_secs(2),
@@ -268,18 +265,14 @@ impl FbOptionsBuilder {
         self
     }
 
-    /// Configures automatic evaluation events and explicit tracking calls.
+    /// Enables or disables all `FeatBit` event collection and delivery.
     ///
-    /// `disable` controls automatic evaluation events. `allow_track` independently controls
-    /// explicit calls to [`crate::FbClient::track_eval_event`] and
-    /// [`crate::FbClient::track_metric_event`]. The event processor is completely disabled only
-    /// when `disable` is `true` and `allow_track` is `false`.
-    ///
-    /// The default is `disable = false, allow_track = true`.
+    /// When `disable` is `true`, automatic evaluation events and explicit evaluation and metric
+    /// tracking are all disabled, and no event worker is started. Flag synchronization, local
+    /// evaluation, and evaluation observers continue to work. The default is `false`.
     #[must_use]
-    pub const fn disable_events(mut self, disable: bool, allow_track: bool) -> Self {
+    pub const fn disable_events(mut self, disable: bool) -> Self {
         self.disable_events = disable;
-        self.allow_track = allow_track;
         self
     }
 

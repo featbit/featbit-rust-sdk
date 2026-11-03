@@ -28,7 +28,6 @@ impl FbOptionsBuilder {
             start_wait: self.start_wait,
             offline: self.offline,
             disable_events: self.disable_events,
-            allow_track: self.allow_track,
             evaluation_observer: self.evaluation_observer,
             connect_timeout: self.connect_timeout,
             close_timeout: self.close_timeout,

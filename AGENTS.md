@@ -129,11 +129,9 @@ Match FeatBit .NET defaults unless Rust semantics require a documented differenc
 - maximum event send attempts: 2;
 - event retry interval: 200 milliseconds.
 
-`disable_events(disable, allow_track)` is the only event-mode configuration API. `disable` controls
-automatic evaluation-event enqueueing; `allow_track` independently controls explicit evaluation and
-metric tracking. The default is `(false, true)`. The event processor is completely disabled only for
-`(true, false)` (or offline mode). README application guidance recommends `(true, true)` so exposure
-events are deferred until the application explicitly tracks them.
+`disable_events(disable)` controls all FeatBit event collection and delivery and defaults to `false`.
+When `true`, automatic evaluation events, explicit evaluation tracking, and metric tracking are all
+disabled, and no event processor worker starts. Offline mode also disables the event processor.
 
 Validate at build time:
 
@@ -225,8 +223,8 @@ Evaluation and `track` calls enqueue immutable payload events using a non-blocki
 
 - Successful detail evaluations retain an immutable event snapshot so an application can call
   `track_eval_event` later without re-reading a newer flag snapshot.
-- `track_eval_event` and `track_metric_event` are available exactly when the `allow_track` argument
-  of `disable_events` is true. They are no-ops when tracking is disallowed, offline mode, shutdown,
+- `track_eval_event` and `track_metric_event` require `disable_events(false)`.
+  They are no-ops when events are disabled, offline mode, shutdown,
   or a full/closed event queue prevents delivery.
 - Integrations may explicitly track the current flag result through a convenience that re-evaluates
   the current immutable snapshot; document that a retained direct detail event is required when the

@@ -46,7 +46,6 @@ fn defaults_match_the_featbit_server_contract() {
     );
     assert!(!options.offline);
     assert!(!options.disable_events);
-    assert!(options.allow_track);
     assert!(!options.events_disabled());
     assert!(options.track_allowed());
     assert!(options.evaluation_observer.is_none());
@@ -54,14 +53,14 @@ fn defaults_match_the_featbit_server_contract() {
 }
 
 #[test]
-fn event_mode_configuration_keeps_disable_and_track_decisions_independent() {
-    for (disable, allow_track) in [(false, true), (false, false), (true, true), (true, false)] {
+fn disable_events_controls_automatic_and_explicit_tracking() {
+    for disable in [false, true] {
         let options = FbOptionsBuilder::new("valid-secret")
-            .disable_events(disable, allow_track)
+            .disable_events(disable)
             .build()
             .expect("event mode should build");
         assert_eq!(options.events_disabled(), disable);
-        assert_eq!(options.track_allowed(), allow_track);
+        assert_eq!(options.track_allowed(), !disable);
     }
 }
 

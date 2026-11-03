@@ -42,7 +42,7 @@ const READY_BOOTSTRAP: &str = r#"{
 fn main() {
     let Ok(options) = FbOptions::builder("benchmark-secret")
         .offline(true)
-        .disable_events(true, false)
+        .disable_events(true)
         .bootstrap_json(READY_BOOTSTRAP)
         .build()
     else {

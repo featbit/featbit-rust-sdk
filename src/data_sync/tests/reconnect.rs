@@ -55,7 +55,7 @@ async fn normal_server_close_reconnects_and_keeps_cached_data_available() {
 
     let options = FbOptionsBuilder::new("valid-environment-secret")
         .streaming_url(format!("ws://{address}"))
-        .disable_events(true, false)
+        .disable_events(true)
         .start_wait(Duration::from_secs(2))
         .connect_timeout(Duration::from_secs(1))
         .close_timeout(Duration::from_secs(1))
@@ -126,7 +126,7 @@ async fn short_failed_connections_advance_the_reconnect_backoff() {
 
     let options = FbOptionsBuilder::new("valid-environment-secret")
         .streaming_url(format!("ws://{address}"))
-        .disable_events(true, false)
+        .disable_events(true)
         .start_wait(Duration::from_secs(1))
         .connect_timeout(Duration::from_millis(100))
         .close_timeout(Duration::from_secs(1))
@@ -232,7 +232,7 @@ async fn malformed_ping_oversize_and_reconnect_follow_the_wire_protocol() {
 
     let options = FbOptionsBuilder::new("valid-environment-secret")
         .streaming_url(format!("ws://{address}"))
-        .disable_events(true, false)
+        .disable_events(true)
         .start_wait(Duration::from_secs(2))
         .connect_timeout(Duration::from_secs(1))
         .close_timeout(Duration::from_secs(1))

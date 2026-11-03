@@ -231,7 +231,7 @@ mod tests {
         let observer = OpenTelemetryEvaluationObserver::new(logger);
         let options = FbOptions::builder("valid-secret")
             .offline(true)
-            .disable_events(true, false)
+            .disable_events(true)
             .evaluation_observer(observer)
             .bootstrap_json(READY_BOOTSTRAP)
             .build()

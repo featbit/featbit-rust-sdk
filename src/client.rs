@@ -214,11 +214,10 @@ impl FbClient {
 
     /// Records a previously captured evaluation event without blocking on network I/O.
     ///
-    /// This is available when the `allow_track` argument to
-    /// [`FbOptionsBuilder::disable_events`] is `true`. It returns `false` when explicit tracking is
-    /// not allowed, the client is not operational, the event is invalid, or the bounded queue is
-    /// full. A retained event does not require the current flag snapshot, so it can be queued while
-    /// initial data synchronization is still pending. Use the event carried by a detail variation
+    /// This is available unless [`FbOptionsBuilder::disable_events`] is set to `true`.
+    /// It returns `false` when events are disabled, the client is not operational, the event is
+    /// invalid, or the bounded queue is full. A retained event does not require the current flag
+    /// snapshot, so it can be queued while initial data synchronization is still pending. Use the event carried by a detail variation
     /// result to preserve the exact variation and experiment decision selected at evaluation time.
     /// Calling this while automatic evaluation events are enabled records a second event for the
     /// same evaluation. The captured insights setting must be enabled; otherwise this returns
@@ -257,11 +256,10 @@ impl FbClient {
 
     /// Records a custom metric event without blocking on network I/O.
     ///
-    /// This is available when the `allow_track` argument to
-    /// [`FbOptionsBuilder::disable_events`] is `true`. It returns `false` when explicit tracking is
-    /// not allowed, the client is not operational, the event is invalid, or the bounded queue is
-    /// full. Metric tracking does not require an initialized flag snapshot and remains available
-    /// while initial data synchronization is pending.
+    /// This is available unless [`FbOptionsBuilder::disable_events`] is set to `true`.
+    /// It returns `false` when events are disabled, the client is not operational, the event is
+    /// invalid, or the bounded queue is full. Metric tracking does not require an initialized flag
+    /// snapshot and remains available while initial data synchronization is pending.
     #[must_use]
     pub fn track_metric_event(&self, user: &FbUser, event_name: &str, numeric_value: f64) -> bool {
         self.tracking_available()
@@ -305,7 +303,7 @@ impl FbClient {
     }
 
     fn tracking_available(&self) -> bool {
-        self.inner.options.allow_track
+        !self.inner.options.disable_events
             && !self.inner.closed.load(Ordering::Acquire)
             && self.inner.status.status() != SyncStatus::Closed
             && self.inner.event_processor.is_accepting()
