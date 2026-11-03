@@ -22,6 +22,15 @@ use crate::worker::WorkerWait;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn client_synchronizes_full_and_patch_over_websocket() {
+    assert_full_and_patch_over_websocket(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn application_pong_keeps_the_connection_alive_for_subsequent_patch() {
+    assert_full_and_patch_over_websocket(true).await;
+}
+
+async fn assert_full_and_patch_over_websocket(reply_to_ping: bool) {
     const FULL: &str = r#"{"messageType":"data-sync","data":{"eventType":"full","featureFlags":[{"id":"flag-id","key":"live-flag","updatedAt":1,"variationType":"boolean","variations":[{"id":"value","value":"true"}],"targetUsers":[],"rules":[],"isEnabled":true,"fallthrough":{"variations":[{"id":"value","rollout":[0,1],"exptRollout":0}]}}],"segments":[]}}"#;
     const PATCH: &str = r#"{"messageType":"data-sync","data":{"eventType":"patch","featureFlags":[{"id":"flag-id","key":"live-flag","updatedAt":2,"variationType":"boolean","variations":[{"id":"value","value":"false"}],"targetUsers":[],"rules":[],"isEnabled":true,"fallthrough":{"variations":[{"id":"value","rollout":[0,1],"exptRollout":0}]}}],"segments":[]}}"#;
 
@@ -51,6 +60,20 @@ async fn client_synchronizes_full_and_patch_over_websocket() {
             .expect("full data should send");
 
         patch_receiver.await.expect("test should request patch");
+        if reply_to_ping {
+            let ping = time::timeout(Duration::from_secs(2), next_test_text(&mut socket))
+                .await
+                .expect("application ping should arrive on the original connection");
+            let ping: serde_json::Value =
+                serde_json::from_str(&ping).expect("application ping should contain JSON");
+            assert_eq!(ping["messageType"], "ping");
+            // FeatBit replies with a JSON text message, not a WebSocket Pong frame.
+            socket
+                .send(Message::Text(r#"{"messageType":"pong","data":{}}"#.into()))
+                .await
+                .expect("application pong should send");
+        }
+        // Only this socket receives the patch: reconnecting cannot satisfy the assertion.
         socket
             .send(Message::Text(PATCH.into()))
             .await
@@ -79,7 +102,11 @@ async fn client_synchronizes_full_and_patch_over_websocket() {
         .start_wait(Duration::from_secs(2))
         .connect_timeout(Duration::from_secs(1))
         .close_timeout(Duration::from_secs(1))
-        .keep_alive_interval(Duration::from_mins(1))
+        .keep_alive_interval(if reply_to_ping {
+            Duration::from_millis(50)
+        } else {
+            Duration::from_mins(1)
+        })
         .build()
         .expect("options should build");
     let client = tokio::task::spawn_blocking(move || FbClient::with_options(options))
@@ -98,6 +125,7 @@ async fn client_synchronizes_full_and_patch_over_websocket() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     assert!(patched, "patch should become visible to evaluation");
+    assert_eq!(client.status(), crate::ClientStatus::Ready);
 
     tokio::task::spawn_blocking(move || client.close())
         .await
