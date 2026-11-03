@@ -116,6 +116,7 @@ impl Evaluator {
         send_to_experiment: bool,
     ) -> EvalResult<'snapshot> {
         EvalResult {
+            insights_enabled: flag.insights_enabled,
             flag_id: &flag.id,
             flag_type: &flag.variation_type,
             variation,

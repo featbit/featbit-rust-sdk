@@ -12,7 +12,7 @@ use crate::model::FbUser;
 /// Detail-returning variation methods produce this value in
 /// [`crate::EvaluationDetail::evaluation_event`]. It preserves the selected raw variation and
 /// experiment attribution decision even if flag data changes before the application records the
-/// exposure.
+/// exposure. The captured insights setting controls whether this event can be delivered.
 #[derive(Clone, Eq, PartialEq)]
 pub struct FbEvaluationEvent {
     flag_key: String,
@@ -20,19 +20,23 @@ pub struct FbEvaluationEvent {
     variation_value: String,
     timestamp: SystemTime,
     send_to_experiment: bool,
+    insights_enabled: bool,
 }
 
 impl FbEvaluationEvent {
     /// Creates an explicit evaluation event using the current time.
     ///
     /// Prefer the event returned by a detail variation method when reporting a real SDK evaluation;
-    /// it carries the exact variation and experiment decision selected at evaluation time.
+    /// it carries the exact variation, experiment decision, and insights setting selected at
+    /// evaluation time. For caller-created events, explicitly supply `insights_enabled`; `false`
+    /// prevents tracking. This constructor does not consult the current flag snapshot.
     #[must_use]
     pub fn new(
         flag_key: impl Into<String>,
         variation_id: impl Into<String>,
         variation_value: impl Into<String>,
         send_to_experiment: bool,
+        insights_enabled: bool,
     ) -> Self {
         Self::at(
             flag_key,
@@ -40,6 +44,7 @@ impl FbEvaluationEvent {
             variation_value,
             SystemTime::now(),
             send_to_experiment,
+            insights_enabled,
         )
     }
 
@@ -49,6 +54,7 @@ impl FbEvaluationEvent {
         variation_value: impl Into<String>,
         timestamp: SystemTime,
         send_to_experiment: bool,
+        insights_enabled: bool,
     ) -> Self {
         Self {
             flag_key: flag_key.into(),
@@ -56,7 +62,18 @@ impl FbEvaluationEvent {
             variation_value: variation_value.into(),
             timestamp,
             send_to_experiment,
+            insights_enabled,
         }
+    }
+
+    /// Returns whether insights collection was enabled in the captured flag snapshot.
+    ///
+    /// A false value prevents automatic and explicit `FeatBit` evaluation tracking, but does not
+    /// affect the evaluated value or evaluation observers. Events created with [`Self::new`]
+    /// use the eligibility explicitly supplied by the caller.
+    #[must_use]
+    pub const fn insights_enabled(&self) -> bool {
+        self.insights_enabled
     }
 
     /// Returns the evaluated flag key.
@@ -99,6 +116,7 @@ impl fmt::Debug for FbEvaluationEvent {
             .field("variation_value", &"[REDACTED]")
             .field("timestamp", &self.timestamp)
             .field("send_to_experiment", &self.send_to_experiment)
+            .field("insights_enabled", &self.insights_enabled)
             .finish()
     }
 }

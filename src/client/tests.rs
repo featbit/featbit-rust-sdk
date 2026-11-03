@@ -132,9 +132,14 @@ fn explicit_tracking_remains_available_while_initial_sync_is_pending() {
         .expect("options should build");
     let client = FbClient::with_options(options);
     let user = FbUser::builder("pending-sync-user").build();
-    let event = FbEvaluationEvent::new("known-result", "variation", "value", false);
+    let event = FbEvaluationEvent::new("known-result", "variation", "value", false, true);
 
     assert_eq!(client.status(), ClientStatus::NotReady);
+    let suppressed = FbEvaluationEvent::new("known-result", "variation", "value", true, false);
+    assert!(!suppressed.insights_enabled());
+    assert!(suppressed.send_to_experiment());
+    assert!(!client.track_eval_event(&user, &suppressed));
+    assert!(event.insights_enabled());
     assert!(client.track_eval_event(&user, &event));
     assert!(client.track_metric_event(&user, "before-initial-sync", 1.0));
     assert!(
@@ -476,3 +481,5 @@ fn observer_is_independent_from_featbit_event_delivery() {
     assert!(!format!("{:?}", observations[0]).contains("private-user-key"));
     client.close();
 }
+
+mod insights;

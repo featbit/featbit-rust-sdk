@@ -492,3 +492,46 @@ fn concurrent_full_updates_never_mix_flags_and_segments() {
         reader.join().expect("snapshot reader should finish");
     }
 }
+
+#[test]
+fn insights_preserves_variation_reason_and_experiment_eligibility_on_every_path() {
+    let user = FbUser::builder("user").build();
+    let mut off = basic_flag("off");
+    off.is_enabled = false;
+    let mut target = basic_flag("target");
+    target.expt_include_all_targets = true;
+    target.target_users.push(TargetUser {
+        key_ids: vec!["user".to_owned()],
+        variation_id: "true".to_owned(),
+    });
+    let mut rule = basic_flag("rule");
+    rule.expt_include_all_targets = true;
+    rule.rules.push(TargetRule {
+        name: "match".to_owned(),
+        variations: vec![rollout("true")],
+        ..TargetRule::default()
+    });
+    let mut fallthrough = basic_flag("fallthrough");
+    fallthrough.expt_include_all_targets = true;
+    for mut flag in [off, target, rule, fallthrough] {
+        let store = SnapshotStore::new();
+        store.populate(&DataSet {
+            feature_flags: vec![flag.clone()],
+            ..DataSet::default()
+        });
+        let before = store.load();
+        let enabled = Evaluator::evaluate(&before, &flag.key, &user).unwrap();
+        flag.insights_enabled = false;
+        store.populate(&DataSet {
+            feature_flags: vec![flag.clone()],
+            ..DataSet::default()
+        });
+        let after = store.load();
+        let disabled = Evaluator::evaluate(&after, &flag.key, &user).unwrap();
+        assert!(enabled.insights_enabled);
+        assert!(!disabled.insights_enabled);
+        assert_eq!(enabled.variation, disabled.variation);
+        assert_eq!(enabled.reason, disabled.reason);
+        assert_eq!(enabled.send_to_experiment, disabled.send_to_experiment);
+    }
+}

@@ -71,7 +71,8 @@ impl RawEvaluation {
         &self.reason
     }
 
-    /// Returns the immutable event snapshot captured with this evaluation.
+    /// Returns the immutable event snapshot captured with this evaluation, including its insights
+    /// eligibility. A disabled insights setting does not invalidate this successful result.
     #[must_use]
     pub const fn evaluation_event(&self) -> &FbEvaluationEvent {
         &self.event
@@ -231,7 +232,7 @@ impl FbClient {
     ) -> T {
         let evaluated = self.evaluate_and_then(key, user, |result| {
             let timestamp = self
-                .should_complete_value_evaluation()
+                .should_complete_value_evaluation(result.insights_enabled)
                 .then(SystemTime::now);
             let value = converter(&result.variation.value)?;
             let observation = timestamp
@@ -269,6 +270,7 @@ impl FbClient {
                 result.variation.value.as_str(),
                 timestamp,
                 result.send_to_experiment,
+                result.insights_enabled,
             );
             Ok((
                 EvaluationDetail {
@@ -322,6 +324,7 @@ impl FbClient {
                 result.variation.value.as_str(),
                 SystemTime::now(),
                 result.send_to_experiment,
+                result.insights_enabled,
             ),
         })
     }
@@ -360,7 +363,8 @@ impl FbClient {
     ///
     /// This applies the same automatic analytics and observer behavior as a successful typed
     /// variation method. Call it at most once for a raw result; repeated calls can enqueue duplicate
-    /// analytics events.
+    /// analytics events. Analytics respect the captured insights setting; success observations
+    /// remain independent of insights eligibility.
     pub fn complete_raw_evaluation(&self, user: &FbUser, evaluation: &RawEvaluation) {
         self.complete_captured_evaluation(
             user,
@@ -369,9 +373,11 @@ impl FbClient {
         );
     }
 
-    fn should_complete_value_evaluation(&self) -> bool {
+    fn should_complete_value_evaluation(&self, insights_enabled: bool) -> bool {
         self.inner.options.evaluation_observer.is_some()
-            || (!self.inner.options.disable_events && self.inner.event_processor.is_accepting())
+            || (insights_enabled
+                && !self.inner.options.disable_events
+                && self.inner.event_processor.is_accepting())
     }
 
     fn complete_evaluation(
@@ -381,7 +387,7 @@ impl FbClient {
         result: EvalResult<'_>,
         timestamp: SystemTime,
     ) -> Option<EvaluationObservation> {
-        if !self.inner.options.disable_events {
+        if result.insights_enabled && !self.inner.options.disable_events {
             let _accepted = self.inner.event_processor.record_evaluation_at(
                 user,
                 key,

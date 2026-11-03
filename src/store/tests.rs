@@ -494,3 +494,32 @@ fn concurrent_evaluation_never_observes_a_partial_flag_and_segment_patch() {
         reader.join().expect("evaluation reader should finish");
     }
 }
+
+#[test]
+fn insights_patches_preserve_versions_and_existing_snapshots() {
+    let store = SnapshotStore::new();
+    let mut flag = basic_flag("insights");
+    let dataset = |flag| DataSet {
+        feature_flags: vec![flag],
+        ..DataSet::default()
+    };
+    store.populate(&dataset(flag.clone()));
+    let enabled_snapshot = store.load();
+    flag.insights_enabled = false;
+    assert_eq!(
+        store.patch(&dataset(flag.clone())),
+        PatchResult::VersionConflict
+    );
+    assert!(store.load().flags["insights"].insights_enabled);
+    flag.updated_at = 2;
+    assert_eq!(store.patch(&dataset(flag.clone())), PatchResult::Changed);
+    assert!(!store.load().flags["insights"].insights_enabled);
+    assert!(enabled_snapshot.flags["insights"].insights_enabled);
+    flag.updated_at = 1;
+    flag.insights_enabled = true;
+    assert_eq!(store.patch(&dataset(flag.clone())), PatchResult::Unchanged);
+    assert!(!store.load().flags["insights"].insights_enabled);
+    flag.updated_at = 3;
+    assert_eq!(store.patch(&dataset(flag)), PatchResult::Changed);
+    assert!(store.load().flags["insights"].insights_enabled);
+}

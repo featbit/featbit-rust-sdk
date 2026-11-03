@@ -100,6 +100,9 @@ impl EventProcessor {
     }
 
     pub(crate) fn record_evaluation(&self, user: &FbUser, event: &FbEvaluationEvent) -> bool {
+        if !event.insights_enabled() {
+            return false;
+        }
         self.record_evaluation_at(
             user,
             event.flag_key(),

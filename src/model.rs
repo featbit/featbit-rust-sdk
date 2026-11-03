@@ -107,7 +107,9 @@ pub(crate) struct DataSet {
     pub(crate) segments: Vec<Segment>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+// These independent boolean fields mirror the FeatBit wire contract, not lifecycle states.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct FeatureFlag {
     #[serde(default)]
@@ -126,6 +128,11 @@ pub(crate) struct FeatureFlag {
     pub(crate) rules: Vec<TargetRule>,
     #[serde(default)]
     pub(crate) is_enabled: bool,
+    #[serde(
+        default = "default_insights_enabled",
+        deserialize_with = "deserialize_insights_enabled"
+    )]
+    pub(crate) insights_enabled: bool,
     #[serde(default)]
     pub(crate) disabled_variation_id: String,
     #[serde(default)]
@@ -134,6 +141,18 @@ pub(crate) struct FeatureFlag {
     pub(crate) expt_include_all_targets: bool,
     #[serde(default)]
     pub(crate) is_archived: bool,
+}
+
+const fn default_insights_enabled() -> bool {
+    true
+}
+
+fn deserialize_insights_enabled<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    // Only an explicit JSON boolean false disables collection, matching the server.
+    Ok(serde_json::Value::deserialize(deserializer)? != serde_json::Value::Bool(false))
 }
 
 impl FeatureFlag {
