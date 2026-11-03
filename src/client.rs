@@ -69,6 +69,8 @@ pub struct EvaluationDetail<T> {
     ///
     /// This is `None` when evaluation returned a fallback or when the detail came from the
     /// inspection-only [`FbClient::all_variations`] API.
+    /// Successful evaluations retain an event even when the flag's `insightsEnabled` is `false`.
+    /// In that case, [`FbClient::track_eval_event`] returns `false` without enqueueing the event.
     pub evaluation_event: Option<FbEvaluationEvent>,
 }
 
@@ -219,7 +221,8 @@ impl FbClient {
     /// initial data synchronization is still pending. Use the event carried by a detail variation
     /// result to preserve the exact variation and experiment decision selected at evaluation time.
     /// Calling this while automatic evaluation events are enabled records a second event for the
-    /// same evaluation.
+    /// same evaluation. The captured insights setting must be enabled; otherwise this returns
+    /// `false`. Later flag updates do not change a retained event's eligibility.
     #[must_use]
     pub fn track_eval_event(&self, user: &FbUser, event: &FbEvaluationEvent) -> bool {
         self.tracking_available() && self.inner.event_processor.record_evaluation(user, event)
@@ -231,7 +234,8 @@ impl FbClient {
     /// [`FbEvaluationEvent`]. Call it promptly after the original resolution. If an intervening flag
     /// update must not change the reported variation, use a direct detail method and pass its
     /// captured event to [`Self::track_eval_event`] instead. Calling this while automatic evaluation
-    /// events are enabled records an additional event.
+    /// events are enabled records an additional event. Returns `false` when insights are disabled
+    /// in the current flag snapshot.
     #[must_use]
     pub fn track_eval_event_for_flag(&self, user: &FbUser, flag_key: &str) -> bool {
         if !self.tracking_available() || !self.evaluation_available() {
@@ -246,6 +250,7 @@ impl FbClient {
             result.variation.id.as_str(),
             result.variation.value.as_str(),
             result.send_to_experiment,
+            result.insights_enabled,
         );
         self.inner.event_processor.record_evaluation(user, &event)
     }

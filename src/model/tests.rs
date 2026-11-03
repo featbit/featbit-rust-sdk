@@ -1,4 +1,25 @@
-use super::{FeatureFlag, Segment};
+use super::{Fallthrough, FeatureFlag, Segment};
+
+// Keep programmatic construction consistent with legacy wire data that omits this field.
+impl Default for FeatureFlag {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            key: String::new(),
+            updated_at: 0,
+            variation_type: String::new(),
+            variations: Vec::new(),
+            target_users: Vec::new(),
+            rules: Vec::new(),
+            is_enabled: false,
+            insights_enabled: true,
+            disabled_variation_id: String::new(),
+            fallthrough: Fallthrough::default(),
+            expt_include_all_targets: false,
+            is_archived: false,
+        }
+    }
+}
 
 const DOTNET_FLAG_JSON: &str = include_str!("fixtures/dotnet-one-flag.json");
 const DOTNET_SEGMENT_JSON: &str = include_str!("fixtures/dotnet-one-segment.json");
@@ -56,5 +77,25 @@ fn updated_at_accepts_protocol_integer_and_rejects_malformed_shapes() {
         r#"{"key":"flag","updatedAt":{}}"#,
     ] {
         assert!(serde_json::from_str::<FeatureFlag>(invalid).is_err());
+    }
+}
+
+#[test]
+fn insights_only_explicit_false_disables_collection() {
+    assert!(FeatureFlag::default().insights_enabled);
+    let missing: FeatureFlag = serde_json::from_str("{}").unwrap();
+    assert!(missing.insights_enabled);
+    for (value, enabled) in [
+        ("false", false),
+        ("true", true),
+        ("null", true),
+        ("0", true),
+        (r#""false""#, true),
+        ("[]", true),
+        ("{}", true),
+    ] {
+        let json = format!(r#"{{"insightsEnabled":{value}}}"#);
+        let flag: FeatureFlag = serde_json::from_str(&json).unwrap();
+        assert_eq!(flag.insights_enabled, enabled, "{value}");
     }
 }
