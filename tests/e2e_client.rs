@@ -134,7 +134,11 @@ fn verify_handshake(request: &Request) {
 
 // Tungstenite fixes the handshake callback's large error type; the test cannot narrow it.
 #[allow(clippy::result_large_err)]
-async fn run_streaming_server(listener: TcpListener, send_patch: oneshot::Receiver<()>) {
+async fn run_streaming_server(
+    listener: TcpListener,
+    send_patch: oneshot::Receiver<()>,
+    disable_insights: bool,
+) {
     let (stream, _) = listener.accept().await.expect("SDK should connect");
     let mut socket = accept_hdr_async(stream, |request: &Request, response: Response| {
         verify_handshake(request);
@@ -159,8 +163,16 @@ async fn run_streaming_server(listener: TcpListener, send_patch: oneshot::Receiv
         .expect("full data should send");
 
     send_patch.await.expect("test should request the patch");
+    let patch = if disable_insights {
+        PATCH.replace(
+            "\"isEnabled\":true",
+            "\"isEnabled\":true,\"insightsEnabled\":false",
+        )
+    } else {
+        PATCH.to_owned()
+    };
     socket
-        .send(Message::Text(PATCH.into()))
+        .send(Message::Text(patch.into()))
         .await
         .expect("patch data should send");
     while let Some(message) = socket.next().await {
@@ -180,7 +192,7 @@ async fn run_streaming_server(listener: TcpListener, send_patch: oneshot::Receiv
     }
 }
 
-async fn start_streaming_server() -> StreamingServer {
+async fn start_streaming_server(disable_insights: bool) -> StreamingServer {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("streaming listener should bind");
@@ -188,7 +200,11 @@ async fn start_streaming_server() -> StreamingServer {
         .local_addr()
         .expect("streaming listener should have an address");
     let (send_patch, patch_receiver) = oneshot::channel();
-    let task = tokio::spawn(run_streaming_server(listener, patch_receiver));
+    let task = tokio::spawn(run_streaming_server(
+        listener,
+        patch_receiver,
+        disable_insights,
+    ));
     StreamingServer {
         url: format!("ws://{address}"),
         send_patch,
@@ -213,7 +229,7 @@ async fn wait_for_raw_value(client: &FbClient, user: &FbUser, expected: &str) {
     .expect("patched value should become visible");
 }
 
-fn assert_event_request(request: &CapturedEventRequest) {
+fn assert_event_request(request: &CapturedEventRequest, disable_insights: bool) {
     assert_eq!(
         request
             .headers
@@ -240,10 +256,17 @@ fn assert_event_request(request: &CapturedEventRequest) {
     let events: Value =
         serde_json::from_slice(&request.body).expect("event request should contain JSON");
     let events = events.as_array().expect("event batch should be an array");
-    assert_eq!(events.len(), 3);
+    assert_eq!(events.len(), if disable_insights { 2 } else { 3 });
     assert_eq!(events[0]["variations"][0]["variation"]["value"], "true");
-    assert_eq!(events[1]["variations"][0]["variation"]["value"], "false");
-    assert_eq!(events[2]["metrics"][0]["eventName"], "e2e-conversion");
+    let metric_index = if disable_insights { 1 } else { 2 };
+    if !disable_insights {
+        assert_eq!(events[1]["variations"][0]["variation"]["value"], "false");
+    }
+    assert_eq!(
+        events[metric_index]["metrics"][0]["eventName"],
+        "e2e-conversion"
+    );
+    assert!(!String::from_utf8_lossy(&request.body).contains("insightsEnabled"));
     assert!(events
         .iter()
         .all(|event| event["user"]["keyId"] == "e2e-user"));
@@ -251,8 +274,17 @@ fn assert_event_request(request: &CapturedEventRequest) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn full_client_sync_evaluation_patch_and_event_delivery() {
+    sync_evaluation_patch_and_event_delivery(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn insights_patch_suppresses_new_events_and_preserves_queued_events() {
+    sync_evaluation_patch_and_event_delivery(true).await;
+}
+
+async fn sync_evaluation_patch_and_event_delivery(disable_insights: bool) {
     let mut events = start_event_server().await;
-    let streaming = start_streaming_server().await;
+    let streaming = start_streaming_server(disable_insights).await;
     let options = FbOptions::builder("e2e-environment-secret")
         .streaming_url(&streaming.url)
         .event_url(&events.url)
@@ -281,6 +313,13 @@ async fn full_client_sync_evaluation_patch_and_event_delivery() {
         .expect("streaming server should still run");
     wait_for_raw_value(&client, &user, "false").await;
     assert!(!client.bool_variation("e2e-flag", &user, true));
+    if disable_insights {
+        let raw = client.evaluate_raw("e2e-flag", &user).unwrap();
+        assert!(!raw.evaluation_event().insights_enabled());
+        client.complete_raw_evaluation(&user, &raw);
+        assert!(!client.track_eval_event(&user, raw.evaluation_event()));
+        assert!(!client.track_eval_event_for_flag(&user, "e2e-flag"));
+    }
     assert!(client.track_metric_event(&user, "e2e-conversion", 1.0));
 
     let flushing = client.clone();
@@ -293,7 +332,7 @@ async fn full_client_sync_evaluation_patch_and_event_delivery() {
         .await
         .expect("event request should arrive")
         .expect("event server should remain available");
-    assert_event_request(&request);
+    assert_event_request(&request, disable_insights);
 
     let closing = client.clone();
     tokio::task::spawn_blocking(move || closing.close())

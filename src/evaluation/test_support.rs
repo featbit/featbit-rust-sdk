@@ -25,6 +25,7 @@ pub(crate) fn basic_flag(key: &str) -> FeatureFlag {
         target_users: Vec::new(),
         rules: Vec::new(),
         is_enabled: true,
+        insights_enabled: true,
         disabled_variation_id: "false".to_owned(),
         fallthrough: Fallthrough {
             variations: vec![rollout("true")],
