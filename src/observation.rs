@@ -85,7 +85,6 @@ pub struct EvaluationObservation {
     variation_value: Option<String>,
     reason: EvaluationObservationReason,
     error: Option<EvaluationObservationError>,
-    send_to_experiment: bool,
 }
 
 impl EvaluationObservation {
@@ -96,7 +95,6 @@ impl EvaluationObservation {
         variation_id: &str,
         variation_value: &str,
         reason: EvaluationObservationReason,
-        send_to_experiment: bool,
     ) -> Self {
         Self {
             timestamp,
@@ -106,7 +104,6 @@ impl EvaluationObservation {
             variation_value: Some(variation_value.to_owned()),
             reason,
             error: None,
-            send_to_experiment,
         }
     }
 
@@ -124,7 +121,6 @@ impl EvaluationObservation {
             variation_value: None,
             reason: EvaluationObservationReason::Error,
             error: Some(error),
-            send_to_experiment: false,
         }
     }
 
@@ -174,12 +170,6 @@ impl EvaluationObservation {
     pub const fn error_type(&self) -> Option<EvaluationObservationError> {
         self.error
     }
-
-    /// Returns whether this exposure is eligible for `FeatBit` experiment attribution.
-    #[must_use]
-    pub const fn send_to_experiment(&self) -> bool {
-        self.send_to_experiment
-    }
 }
 
 impl fmt::Debug for EvaluationObservation {
@@ -196,7 +186,6 @@ impl fmt::Debug for EvaluationObservation {
             .field("has_variation_value", &self.variation_value.is_some())
             .field("reason", &self.reason)
             .field("error", &self.error)
-            .field("send_to_experiment", &self.send_to_experiment)
             .finish()
     }
 }

@@ -39,11 +39,11 @@ cargo add env_logger
 ```
 
 These commands update `Cargo.toml`. To pin this release exactly, use
-`cargo add featbit-server-sdk@=0.1.1`. The equivalent manual configuration is:
+`cargo add featbit-server-sdk@=0.2.1`. The equivalent manual configuration is:
 
 ```toml
 [dependencies]
-featbit-server-sdk = "0.1.1"
+featbit-server-sdk = "0.2.1"
 env_logger = "0.11"
 ```
 

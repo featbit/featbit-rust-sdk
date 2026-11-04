@@ -19,8 +19,8 @@ let options = FbOptions::builder("environment-secret")
     .build()?;
 ```
 
-The adapter exports the flag key, provider name, variation ID, normalized reason, experiment-eligibility
-boolean, and standardized error type. Targeting keys and raw variation values are excluded by default;
+The adapter exports the flag key, provider name, variation ID, normalized reason,
+and standardized error type. Targeting keys and raw variation values are excluded by default;
 enable them only after making an explicit privacy and cardinality decision:
 
 ```rust,ignore

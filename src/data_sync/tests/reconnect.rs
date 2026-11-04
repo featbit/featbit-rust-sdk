@@ -1,5 +1,5 @@
-const RECONNECT_FULL: &str = r#"{"messageType":"data-sync","data":{"eventType":"full","featureFlags":[{"id":"flag-id","key":"reconnected-flag","updatedAt":7,"variationType":"boolean","variations":[{"id":"value","value":"true"}],"targetUsers":[],"rules":[],"isEnabled":true,"fallthrough":{"variations":[{"id":"value","rollout":[0,1],"exptRollout":0}]}}],"segments":[]}}"#;
-const NORMAL_CLOSE_PATCH: &str = r#"{"messageType":"data-sync","data":{"eventType":"patch","featureFlags":[{"id":"flag-id","key":"reconnected-flag","updatedAt":8,"variationType":"boolean","variations":[{"id":"value","value":"false"}],"targetUsers":[],"rules":[],"isEnabled":true,"fallthrough":{"variations":[{"id":"value","rollout":[0,1],"exptRollout":0}]}}],"segments":[]}}"#;
+const RECONNECT_FULL: &str = r#"{"messageType":"data-sync","data":{"eventType":"full","featureFlags":[{"id":"flag-id","key":"reconnected-flag","updatedAt":7,"variationType":"boolean","variations":[{"id":"value","value":"true"}],"targetUsers":[],"rules":[],"isEnabled":true,"fallthrough":{"variations":[{"id":"value","rollout":[0,1]}]}}],"segments":[]}}"#;
+const NORMAL_CLOSE_PATCH: &str = r#"{"messageType":"data-sync","data":{"eventType":"patch","featureFlags":[{"id":"flag-id","key":"reconnected-flag","updatedAt":8,"variationType":"boolean","variations":[{"id":"value","value":"false"}],"targetUsers":[],"rules":[],"isEnabled":true,"fallthrough":{"variations":[{"id":"value","rollout":[0,1]}]}}],"segments":[]}}"#;
 
 use std::time::Duration;
 

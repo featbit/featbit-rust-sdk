@@ -29,15 +29,15 @@ const READY_BOOTSTRAP: &str = r#"{
             "id":"flag-id","key":"enabled","updatedAt":1,"variationType":"boolean",
             "variations":[{"id":"value","value":"true"}],
             "targetUsers":[],"rules":[],"isEnabled":true,
-            "fallthrough":{"includedInExpt":false,"variations":[
-                {"id":"value","rollout":[0,1],"exptRollout":0}
+            "fallthrough":{"variations":[
+                {"id":"value","rollout":[0,1]}
             ]}
         },{
             "id":"invalid-flag-id","key":"invalid-bool","updatedAt":1,"variationType":"boolean",
             "variations":[{"id":"invalid-value","value":"not-a-boolean"}],
             "targetUsers":[],"rules":[],"isEnabled":true,
-            "fallthrough":{"includedInExpt":false,"variations":[
-                {"id":"invalid-value","rollout":[0,1],"exptRollout":0}
+            "fallthrough":{"variations":[
+                {"id":"invalid-value","rollout":[0,1]}
             ]}
         }],"segments":[]}
     }"#;
@@ -50,8 +50,8 @@ const UPDATED_BOOTSTRAP: &str = r#"{
             "id":"flag-id","key":"enabled","updatedAt":2,"variationType":"boolean",
             "variations":[{"id":"value","value":"false"}],
             "targetUsers":[],"rules":[],"isEnabled":true,
-            "fallthrough":{"includedInExpt":false,"variations":[
-                {"id":"value","rollout":[0,1],"exptRollout":0}
+            "fallthrough":{"variations":[
+                {"id":"value","rollout":[0,1]}
             ]}
         }],"segments":[]}
     }"#;
@@ -132,12 +132,11 @@ fn explicit_tracking_remains_available_while_initial_sync_is_pending() {
         .expect("options should build");
     let client = FbClient::with_options(options);
     let user = FbUser::builder("pending-sync-user").build();
-    let event = FbEvaluationEvent::new("known-result", "variation", "value", false, true);
+    let event = FbEvaluationEvent::new("known-result", "variation", "value", true);
 
     assert_eq!(client.status(), ClientStatus::NotReady);
-    let suppressed = FbEvaluationEvent::new("known-result", "variation", "value", true, false);
+    let suppressed = FbEvaluationEvent::new("known-result", "variation", "value", false);
     assert!(!suppressed.insights_enabled());
-    assert!(suppressed.send_to_experiment());
     assert!(!client.track_eval_event(&user, &suppressed));
     assert!(event.insights_enabled());
     assert!(client.track_eval_event(&user, &event));

@@ -31,7 +31,6 @@ struct SuccessfulEvaluation<'a> {
     variation_id: &'a str,
     variation_value: &'a str,
     reason: EvaluationObservationReason,
-    send_to_experiment: bool,
 }
 
 impl RawEvaluation {
@@ -269,7 +268,6 @@ impl FbClient {
                 result.variation.id.as_str(),
                 result.variation.value.as_str(),
                 timestamp,
-                result.send_to_experiment,
                 result.insights_enabled,
             );
             Ok((
@@ -323,7 +321,6 @@ impl FbClient {
                 result.variation.id.as_str(),
                 result.variation.value.as_str(),
                 SystemTime::now(),
-                result.send_to_experiment,
                 result.insights_enabled,
             ),
         })
@@ -394,7 +391,6 @@ impl FbClient {
                 &result.variation.id,
                 &result.variation.value,
                 timestamp,
-                result.send_to_experiment,
             );
         }
         self.successful_evaluation_observation(SuccessfulEvaluation {
@@ -404,7 +400,6 @@ impl FbClient {
             variation_id: &result.variation.id,
             variation_value: &result.variation.value,
             reason: observation_reason_borrowed(result.reason),
-            send_to_experiment: result.send_to_experiment,
         })
     }
 
@@ -424,7 +419,6 @@ impl FbClient {
             variation_id: event.variation_id(),
             variation_value: event.variation_value(),
             reason,
-            send_to_experiment: event.send_to_experiment(),
         });
         self.notify_successful_evaluation(observation);
     }
@@ -441,7 +435,6 @@ impl FbClient {
             evaluation.variation_id,
             evaluation.variation_value,
             evaluation.reason,
-            evaluation.send_to_experiment,
         ))
     }
 

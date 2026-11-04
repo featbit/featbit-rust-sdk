@@ -219,7 +219,7 @@ impl FbClient {
     /// not allowed, the client is not operational, the event is invalid, or the bounded queue is
     /// full. A retained event does not require the current flag snapshot, so it can be queued while
     /// initial data synchronization is still pending. Use the event carried by a detail variation
-    /// result to preserve the exact variation and experiment decision selected at evaluation time.
+    /// result to preserve the exact variation selected at evaluation time.
     /// Calling this while automatic evaluation events are enabled records a second event for the
     /// same evaluation. The captured insights setting must be enabled; otherwise this returns
     /// `false`. Later flag updates do not change a retained event's eligibility.
@@ -249,7 +249,6 @@ impl FbClient {
             flag_key,
             result.variation.id.as_str(),
             result.variation.value.as_str(),
-            result.send_to_experiment,
             result.insights_enabled,
         );
         self.inner.event_processor.record_evaluation(user, &event)

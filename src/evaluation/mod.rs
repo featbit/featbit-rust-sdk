@@ -87,6 +87,5 @@ pub(crate) struct EvalResult<'a> {
     pub(crate) flag_type: &'a str,
     pub(crate) variation: &'a Variation,
     pub(crate) reason: EvalReason<'a>,
-    pub(crate) send_to_experiment: bool,
     pub(crate) insights_enabled: bool,
 }

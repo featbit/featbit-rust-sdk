@@ -50,8 +50,6 @@ also cover:
 - selection between multiple rollout variations;
 - the default `flagKey + userKey` dispatch key;
 - substitution by a configured user property;
-- deterministic `expt`-prefixed experiment sampling;
-- both `sendToExperiment = true` and `false` outcomes.
 
 ## Detailed evaluation output
 
@@ -71,7 +69,7 @@ cargo test --workspace --all-features evaluation::operators -- --show-output
 ```
 
 The output includes exact expected and actual rollout values, IEEE-754 bit patterns, dispatch-key
-source, selected variation and reason, experiment threshold and decision, and every one of the 34
+source, selected variation and reason, and every one of the 34
 .NET condition-operator fixtures. Example fields are:
 
 ```text
@@ -90,7 +88,7 @@ condition user="10" operator=BiggerThan rule="9" expected=true actual=true
 | `WebSocketDataSynchronizerTests` | Covered | Initial full/patch sync, a pre-populated initial version, reconnect/version continuation, explicit stale evaluation, pre/post-initialization `4003`, conflict resync, and shutdown. |
 | `ConditionMatcherTests` | Covered | All 34 exact .NET numeric, string, regex, collection, and boolean fixtures, plus malformed and unknown operators. |
 | `DispatchAlgorithmTests` | Covered exactly | All three .NET keys use bit-for-bit `f64` equality. |
-| `EvaluatorTests` | Covered | Not found, archived, disabled, target, rule, fallthrough, errors, reasons, variation IDs, rollout keys, and experiment decisions. |
+| `EvaluatorTests` | Covered | Not found, archived, disabled, target, rule, fallthrough, errors, reasons, variation IDs, and rollout keys. |
 | `RuleMatcherTests` | Covered | AND semantics, first match, segment conditions, and rollout result selection. |
 | `SegmentMatcherTests` | Covered | Exclusion precedence, inclusion, rule matching, any-segment matching, archived/missing/malformed references, and positive/negative forms. |
 | `AsyncEventTests` | Not applicable | Rust worker completion and bounded flush/close waits cover the lifecycle contract without a TaskCompletionSource-style helper. |

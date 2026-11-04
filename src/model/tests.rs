@@ -15,7 +15,6 @@ impl Default for FeatureFlag {
             insights_enabled: true,
             disabled_variation_id: String::new(),
             fallthrough: Fallthrough::default(),
-            expt_include_all_targets: false,
             is_archived: false,
         }
     }
@@ -44,7 +43,6 @@ fn feature_flag_deserializes_from_pinned_dotnet_wire_fixture() {
     assert_eq!(flag.rules[1].variations[0].rollout, [0.0, 0.2]);
     assert_eq!(flag.disabled_variation_id, flag.variations[1].id);
     assert!(flag.is_enabled);
-    assert!(flag.expt_include_all_targets);
     assert!(!flag.is_archived);
 }
 
@@ -97,5 +95,26 @@ fn insights_only_explicit_false_disables_collection() {
         let json = format!(r#"{{"insightsEnabled":{value}}}"#);
         let flag: FeatureFlag = serde_json::from_str(&json).unwrap();
         assert_eq!(flag.insights_enabled, enabled, "{value}");
+    }
+}
+
+#[test]
+fn obsolete_experiment_metadata_is_ignored() {
+    let expected: FeatureFlag = serde_json::from_str(DOTNET_FLAG_JSON).unwrap();
+    for metadata in [serde_json::Value::Null, serde_json::json!({"unused": true})] {
+        let mut wire: serde_json::Value = serde_json::from_str(DOTNET_FLAG_JSON).unwrap();
+        wire["exptIncludeAllTargets"] = metadata.clone();
+        wire["fallthrough"]["includedInExpt"] = metadata.clone();
+        for variation in wire["fallthrough"]["variations"].as_array_mut().unwrap() {
+            variation["exptRollout"] = metadata.clone();
+        }
+        for rule in wire["rules"].as_array_mut().unwrap() {
+            rule["includedInExpt"] = metadata.clone();
+            for variation in rule["variations"].as_array_mut().unwrap() {
+                variation["exptRollout"] = metadata.clone();
+            }
+        }
+        let actual: FeatureFlag = serde_json::from_value(wire).unwrap();
+        assert_eq!(actual, expected);
     }
 }

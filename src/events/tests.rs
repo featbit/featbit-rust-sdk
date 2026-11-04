@@ -35,18 +35,18 @@ fn normalize_timestamps(value: &mut Value) {
 
 #[test]
 fn evaluation_wire_shape_matches_featbit() {
-    let tracked = FbEvaluationEvent::new("checkout", "on-id", "true", true, true);
+    let tracked = FbEvaluationEvent::new("checkout", "on-id", "true", true);
     let event = PayloadEvent::evaluation(&test_user(), &tracked);
     let value = serde_json::to_value(event).expect("event should serialize");
     assert_eq!(value["user"]["keyId"], "u1");
     assert_eq!(value["variations"][0]["featureFlagKey"], "checkout");
     assert_eq!(value["variations"][0]["variation"]["id"], "on-id");
-    assert_eq!(value["variations"][0]["sendToExperiment"], true);
+    assert!(value["variations"][0].get("sendToExperiment").is_none());
 }
 
 #[test]
 fn public_evaluation_event_debug_redacts_the_raw_value() {
-    let event = FbEvaluationEvent::new("checkout", "on-id", "private-variation-value", false, true);
+    let event = FbEvaluationEvent::new("checkout", "on-id", "private-variation-value", true);
     let debug = format!("{event:?}");
     assert!(debug.contains("[REDACTED]"));
     assert!(!debug.contains("private-variation-value"));
@@ -75,11 +75,11 @@ fn single_multi_and_mixed_event_serialization_matches_featbit_wire_fixtures() {
         .build();
     let eval_one = PayloadEvent::evaluation(
         &user_one,
-        &FbEvaluationEvent::new("hello", "v1Id", "v1", true, true),
+        &FbEvaluationEvent::new("hello", "v1Id", "v1", true),
     );
     let eval_two = PayloadEvent::evaluation(
         &user_two,
-        &FbEvaluationEvent::new("hello", "v2Id", "v2", false, true),
+        &FbEvaluationEvent::new("hello", "v2Id", "v2", true),
     );
     let metric_one = PayloadEvent::metric(&user_one, "click-button", 1.5);
     let metric_two = PayloadEvent::metric(&user_two, "click-button", 32.5);
@@ -100,8 +100,7 @@ fn single_multi_and_mixed_event_serialization_matches_featbit_wire_fixtures() {
             "variations": [{
                 "featureFlagKey": "hello",
                 "variation": {"id": "v1Id", "value": "v1"},
-                "timestamp": 0,
-                "sendToExperiment": true
+                "timestamp": 0
             }]
         })
     );
@@ -115,10 +114,9 @@ fn single_multi_and_mixed_event_serialization_matches_featbit_wire_fixtures() {
         evaluation_batch[1]["variations"][0]["variation"]["value"],
         "v2"
     );
-    assert_eq!(
-        evaluation_batch[1]["variations"][0]["sendToExperiment"],
-        false
-    );
+    assert!(evaluation_batch[1]["variations"][0]
+        .get("sendToExperiment")
+        .is_none());
 
     let mut metric_batch = serde_json::to_value([metric_one.clone(), metric_two])
         .expect("metric batch should serialize");
@@ -185,7 +183,6 @@ fn retained_size_estimates_cover_owned_payload_allocations() {
             "large-json-flag",
             "variation-id",
             r#"{"nested":{"enabled":true,"items":["one","two","three"]}}"#,
-            true,
             true,
         ),
     );
@@ -349,7 +346,7 @@ fn large_json_variation_is_delivered_without_truncation() {
 
     assert!(processor.record_evaluation(
         &test_user(),
-        &FbEvaluationEvent::new("json-flag", "json-id", large_json.clone(), false, true)
+        &FbEvaluationEvent::new("json-flag", "json-id", large_json.clone(), true)
     ));
     assert!(processor.flush_and_wait(Duration::from_secs(5)));
     processor.close();
@@ -381,7 +378,7 @@ fn oversized_event_is_dropped_whole_and_capacity_recovers() {
 
     assert!(!processor.record_evaluation(
         &test_user(),
-        &FbEvaluationEvent::new("large", "large-id", "x".repeat(4_096), false, true)
+        &FbEvaluationEvent::new("large", "large-id", "x".repeat(4_096), true)
     ));
     assert_eq!(inner.capacity.queued_events.load(Ordering::Relaxed), 0);
     assert_eq!(inner.capacity.retained_bytes.load(Ordering::Relaxed), 0);
@@ -445,8 +442,7 @@ fn byte_budget_covers_an_event_while_its_http_request_is_in_flight() {
     let EventProcessor::Active(inner) = &processor else {
         panic!("event processor should start");
     };
-    let event =
-        FbEvaluationEvent::new("memory-bound", "variation-id", variation_value, false, true);
+    let event = FbEvaluationEvent::new("memory-bound", "variation-id", variation_value, true);
 
     assert!(processor.record_evaluation(&user, &event));
     accepted_receiver
@@ -493,15 +489,15 @@ fn invalid_event_fields_are_rejected_before_enqueue() {
 
     assert!(!processor.record_evaluation(
         &valid_user,
-        &FbEvaluationEvent::new("", "variation", "value", false, true)
+        &FbEvaluationEvent::new("", "variation", "value", true)
     ));
     assert!(!processor.record_evaluation(
         &valid_user,
-        &FbEvaluationEvent::new("flag", " ", "value", false, true)
+        &FbEvaluationEvent::new("flag", " ", "value", true)
     ));
     assert!(!processor.record_evaluation(
         &empty_user,
-        &FbEvaluationEvent::new("flag", "variation", "value", false, true)
+        &FbEvaluationEvent::new("flag", "variation", "value", true)
     ));
     assert!(!processor.record_metric(&valid_user, "", 1.0));
     assert!(!processor.record_metric(&valid_user, "metric", f64::NAN));
@@ -917,7 +913,7 @@ fn connection_level_delivery_failure_retries_the_unchanged_batch() {
 
     assert!(processor.record_evaluation(
         &test_user(),
-        &FbEvaluationEvent::new("transport-retry", "variation-id", &large_json, false, true)
+        &FbEvaluationEvent::new("transport-retry", "variation-id", &large_json, true)
     ));
     assert!(processor.flush_and_wait(Duration::from_secs(2)));
     processor.close();

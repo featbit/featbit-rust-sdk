@@ -14,10 +14,6 @@ pub(super) fn rollout_of_key(key: &str) -> f64 {
     ((f64::from(signed)) / f64::from(i32::MIN)).abs()
 }
 
-pub(super) fn is_in_rollout(key: &str, rollout: &[f64]) -> bool {
-    RolloutMatcher::new(key).matches(rollout)
-}
-
 pub(super) struct RolloutMatcher<'key> {
     key: &'key str,
     value: Option<f64>,
@@ -82,7 +78,7 @@ pub(super) fn is_percentage_split(variations: &[RolloutVariation]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_in_rollout, rollout_of_key, RolloutMatcher};
+    use super::{rollout_of_key, RolloutMatcher};
 
     // Compatibility fixtures copied verbatim from FeatBit .NET Server SDK commit
     // 974e2a7a557095b300e4e89da86df7d6fa894963,
@@ -116,24 +112,21 @@ mod tests {
     #[test]
     fn rollout_ranges_handle_protocol_boundaries_and_invalid_data() {
         for key in DOTNET_DISPATCH_FIXTURES.map(|(key, _)| key) {
-            assert!(is_in_rollout(key, &[0.0, 1.0]));
-            assert!(!is_in_rollout(key, &[0.0, 0.0]));
+            assert!(RolloutMatcher::new(key).matches(&[0.0, 1.0]));
+            assert!(!RolloutMatcher::new(key).matches(&[0.0, 0.0]));
         }
 
-        assert!(!is_in_rollout("key", &[]));
-        assert!(!is_in_rollout("key", &[0.0]));
-        assert!(!is_in_rollout("key", &[0.8, 0.2]));
-        assert!(!is_in_rollout("key", &[f64::NAN, 1.0]));
-        assert!(!is_in_rollout("key", &[0.0, f64::INFINITY]));
+        assert!(!RolloutMatcher::new("key").matches(&[]));
+        assert!(!RolloutMatcher::new("key").matches(&[0.0]));
+        assert!(!RolloutMatcher::new("key").matches(&[0.8, 0.2]));
+        assert!(!RolloutMatcher::new("key").matches(&[f64::NAN, 1.0]));
+        assert!(!RolloutMatcher::new("key").matches(&[0.0, f64::INFINITY]));
 
         let exact_boundary = rollout_of_key("test-value");
         println!(
             "inclusive rollout boundary key=\"test-value\" value={exact_boundary:.17} range=[{exact_boundary:.17}, {exact_boundary:.17}]"
         );
-        assert!(is_in_rollout(
-            "test-value",
-            &[exact_boundary, exact_boundary]
-        ));
+        assert!(RolloutMatcher::new("test-value").matches(&[exact_boundary, exact_boundary]));
     }
 
     #[test]
