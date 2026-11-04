@@ -5,9 +5,7 @@ use super::Evaluator;
 use crate::evaluation::dispatch::rollout_of_key;
 use crate::evaluation::test_support::{basic_flag, rollout};
 use crate::evaluation::{EvalError, EvalReason};
-use crate::model::{
-    Condition, DataSet, Fallthrough, FbUser, RolloutVariation, Segment, TargetRule, TargetUser,
-};
+use crate::model::{Condition, DataSet, FbUser, RolloutVariation, Segment, TargetRule, TargetUser};
 use crate::prepared::IS_IN_SEGMENT;
 use crate::store::{test_snapshot_map, DataSnapshot, SnapshotStore};
 
@@ -183,72 +181,6 @@ fn rules_are_and_conditions_and_first_match_wins() {
 }
 
 #[test]
-fn experiment_delivery_matches_dotnet_target_rule_and_fallthrough_semantics() {
-    let user = FbUser::builder("u1").custom("tier", "pro").build();
-
-    let mut targeted = basic_flag("targeted");
-    targeted.expt_include_all_targets = true;
-    targeted.target_users.push(TargetUser {
-        key_ids: vec!["u1".to_owned()],
-        variation_id: "true".to_owned(),
-    });
-
-    let mut rule = basic_flag("rule-experiment");
-    rule.rules.push(TargetRule {
-        name: "not included".to_owned(),
-        included_in_expt: false,
-        conditions: vec![Condition {
-            property: "tier".to_owned(),
-            op: "Equal".to_owned(),
-            value: "pro".to_owned(),
-        }],
-        variations: vec![crate::model::RolloutVariation {
-            id: "true".to_owned(),
-            rollout: vec![0.0, 1.0],
-            expt_rollout: 1.0,
-        }],
-        ..TargetRule::default()
-    });
-
-    let mut fallthrough = basic_flag("fallthrough-experiment");
-    fallthrough.fallthrough = Fallthrough {
-        included_in_expt: true,
-        variations: vec![crate::model::RolloutVariation {
-            id: "true".to_owned(),
-            rollout: vec![0.0, 1.0],
-            expt_rollout: 1.0,
-        }],
-        ..Fallthrough::default()
-    };
-
-    let snapshot = DataSnapshot {
-        flags: test_snapshot_map(
-            [targeted, rule, fallthrough]
-                .into_iter()
-                .map(|flag| (flag.key.clone(), Arc::new(flag))),
-        ),
-        populated: true,
-        ..DataSnapshot::default()
-    };
-
-    assert!(
-        Evaluator::evaluate(&snapshot, "targeted", &user)
-            .expect("target should resolve")
-            .send_to_experiment
-    );
-    assert!(
-        !Evaluator::evaluate(&snapshot, "rule-experiment", &user)
-            .expect("rule should resolve")
-            .send_to_experiment
-    );
-    assert!(
-        Evaluator::evaluate(&snapshot, "fallthrough-experiment", &user)
-            .expect("fallthrough should resolve")
-            .send_to_experiment
-    );
-}
-
-#[test]
 fn rollout_selection_uses_dotnet_default_and_custom_dispatch_keys() {
     let user = FbUser::builder("user-default")
         .custom("bucket", "value")
@@ -257,12 +189,10 @@ fn rollout_selection_uses_dotnet_default_and_custom_dispatch_keys() {
         RolloutVariation {
             id: "true".to_owned(),
             rollout: vec![0.0, 0.3],
-            expt_rollout: 0.0,
         },
         RolloutVariation {
             id: "false".to_owned(),
             rollout: vec![0.3, 1.0],
-            expt_rollout: 0.0,
         },
     ];
 
@@ -316,48 +246,6 @@ fn rollout_selection_uses_dotnet_default_and_custom_dispatch_keys() {
         custom_result.reason,
         EvalReason::Fallthrough { split: true }
     );
-}
-
-#[test]
-fn experiment_sampling_uses_expt_prefixed_dispatch_key() {
-    let user = FbUser::builder("value").build();
-    let mut flag = basic_flag("test-");
-    flag.fallthrough.included_in_expt = true;
-    flag.fallthrough.variations = vec![RolloutVariation {
-        id: "true".to_owned(),
-        rollout: vec![0.0, 1.0],
-        expt_rollout: 0.5,
-    }];
-
-    let snapshot = |flag| DataSnapshot {
-        flags: test_snapshot_map([("test-".to_owned(), Arc::new(flag))]),
-        populated: true,
-        ..DataSnapshot::default()
-    };
-    let prefixed_rollout = rollout_of_key("expttest-value");
-    let excluded_snapshot = snapshot(flag.clone());
-    let excluded = Evaluator::evaluate(&excluded_snapshot, "test-", &user)
-        .expect("fallthrough should resolve");
-    println!(
-        "evaluation experiment_dispatch_key=\"expttest-value\" rollout={prefixed_rollout:.17} experiment_upper=0.50000000000000000 send_to_experiment={}",
-        excluded.send_to_experiment
-    );
-    assert_eq!(
-        prefixed_rollout.to_bits(),
-        0.574_286_515_358_835_5_f64.to_bits()
-    );
-    assert!(!excluded.send_to_experiment);
-
-    let mut included_flag = flag;
-    included_flag.fallthrough.variations[0].expt_rollout = 0.6;
-    let included_snapshot = snapshot(included_flag);
-    let included = Evaluator::evaluate(&included_snapshot, "test-", &user)
-        .expect("fallthrough should resolve");
-    println!(
-        "evaluation experiment_dispatch_key=\"expttest-value\" rollout={prefixed_rollout:.17} experiment_upper=0.60000000000000000 send_to_experiment={}",
-        included.send_to_experiment
-    );
-    assert!(included.send_to_experiment);
 }
 
 #[test]
@@ -422,10 +310,6 @@ fn preprocessed_snapshot_preserves_rule_and_segment_results() {
         .expect("prepared snapshot should evaluate");
     assert_eq!(prepared_result.variation, raw_result.variation);
     assert_eq!(prepared_result.reason, raw_result.reason);
-    assert_eq!(
-        prepared_result.send_to_experiment,
-        raw_result.send_to_experiment
-    );
     assert_eq!(prepared_result.variation.value, "false");
 }
 
@@ -494,25 +378,22 @@ fn concurrent_full_updates_never_mix_flags_and_segments() {
 }
 
 #[test]
-fn insights_preserves_variation_reason_and_experiment_eligibility_on_every_path() {
+fn insights_preserves_variation_and_reason_on_every_path() {
     let user = FbUser::builder("user").build();
     let mut off = basic_flag("off");
     off.is_enabled = false;
     let mut target = basic_flag("target");
-    target.expt_include_all_targets = true;
     target.target_users.push(TargetUser {
         key_ids: vec!["user".to_owned()],
         variation_id: "true".to_owned(),
     });
     let mut rule = basic_flag("rule");
-    rule.expt_include_all_targets = true;
     rule.rules.push(TargetRule {
         name: "match".to_owned(),
         variations: vec![rollout("true")],
         ..TargetRule::default()
     });
-    let mut fallthrough = basic_flag("fallthrough");
-    fallthrough.expt_include_all_targets = true;
+    let fallthrough = basic_flag("fallthrough");
     for mut flag in [off, target, rule, fallthrough] {
         let store = SnapshotStore::new();
         store.populate(&DataSet {
@@ -532,6 +413,5 @@ fn insights_preserves_variation_reason_and_experiment_eligibility_on_every_path(
         assert!(!disabled.insights_enabled);
         assert_eq!(enabled.variation, disabled.variation);
         assert_eq!(enabled.reason, disabled.reason);
-        assert_eq!(enabled.send_to_experiment, disabled.send_to_experiment);
     }
 }

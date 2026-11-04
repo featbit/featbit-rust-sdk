@@ -109,7 +109,6 @@ impl EventProcessor {
             event.variation_id(),
             event.variation_value(),
             event.timestamp(),
-            event.send_to_experiment(),
         )
     }
 
@@ -120,7 +119,6 @@ impl EventProcessor {
         variation_id: &str,
         variation_value: &str,
         timestamp: SystemTime,
-        send_to_experiment: bool,
     ) -> bool {
         if user.key().is_empty() || flag_key.trim().is_empty() || variation_id.trim().is_empty() {
             log::debug!("discarding invalid FeatBit evaluation event");
@@ -133,14 +131,7 @@ impl EventProcessor {
             PayloadEvent::estimated_evaluation_size(user, flag_key, variation_id, variation_value)
                 .saturating_add(size_of::<EventAdmission>());
         self.record(retained_bytes, || {
-            PayloadEvent::evaluation_at(
-                user,
-                flag_key,
-                variation_id,
-                variation_value,
-                timestamp,
-                send_to_experiment,
-            )
+            PayloadEvent::evaluation_at(user, flag_key, variation_id, variation_value, timestamp)
         })
     }
 

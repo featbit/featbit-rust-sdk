@@ -138,8 +138,6 @@ pub(crate) struct FeatureFlag {
     #[serde(default)]
     pub(crate) fallthrough: Fallthrough,
     #[serde(default)]
-    pub(crate) expt_include_all_targets: bool,
-    #[serde(default)]
     pub(crate) is_archived: bool,
 }
 
@@ -187,8 +185,6 @@ pub(crate) struct TargetRule {
     #[serde(default)]
     pub(crate) dispatch_key: Option<String>,
     #[serde(default)]
-    pub(crate) included_in_expt: bool,
-    #[serde(default)]
     pub(crate) conditions: Vec<Condition>,
     #[serde(default)]
     pub(crate) variations: Vec<RolloutVariation>,
@@ -200,8 +196,6 @@ pub(crate) struct Fallthrough {
     #[serde(default)]
     pub(crate) dispatch_key: Option<String>,
     #[serde(default)]
-    pub(crate) included_in_expt: bool,
-    #[serde(default)]
     pub(crate) variations: Vec<RolloutVariation>,
 }
 
@@ -212,8 +206,6 @@ pub(crate) struct RolloutVariation {
     pub(crate) id: String,
     #[serde(default)]
     pub(crate) rollout: Vec<f64>,
-    #[serde(default)]
-    pub(crate) expt_rollout: f64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq)]

@@ -2,7 +2,7 @@ use crate::model::{FbUser, FeatureFlag, RolloutVariation, Variation};
 use crate::prepared::PreparedFlag;
 use crate::store::DataSnapshot;
 
-use super::dispatch::{is_in_rollout, is_percentage_split, RolloutMatcher};
+use super::dispatch::{is_percentage_split, RolloutMatcher};
 use super::segments::rule_matches_prepared;
 use super::{EvalError, EvalReason, EvalResult};
 
@@ -38,7 +38,7 @@ impl Evaluator {
         if !flag.is_enabled {
             let variation = Self::variation(flag, prepared, &flag.disabled_variation_id)
                 .ok_or(EvalError::MalformedFlag)?;
-            return Ok(Self::result(flag, variation, EvalReason::Off, false));
+            return Ok(Self::result(flag, variation, EvalReason::Off));
         }
 
         let target_variation = prepared
@@ -52,12 +52,7 @@ impl Evaluator {
         if let Some(variation_id) = target_variation {
             let variation =
                 Self::variation(flag, prepared, variation_id).ok_or(EvalError::MalformedFlag)?;
-            return Ok(Self::result(
-                flag,
-                variation,
-                EvalReason::TargetMatch,
-                flag.expt_include_all_targets,
-            ));
+            return Ok(Self::result(flag, variation, EvalReason::TargetMatch));
         }
 
         for (rule_index, rule) in flag.rules.iter().enumerate() {
@@ -71,12 +66,6 @@ impl Evaluator {
                 .ok_or(EvalError::MalformedFlag)?;
             let variation =
                 Self::variation(flag, prepared, &rollout.id).ok_or(EvalError::MalformedFlag)?;
-            let send_to_experiment = Self::should_send_to_experiment(
-                flag.expt_include_all_targets,
-                rule.included_in_expt,
-                &dispatch_key,
-                rollout,
-            );
             return Ok(Self::result(
                 flag,
                 variation,
@@ -84,7 +73,6 @@ impl Evaluator {
                     name: &rule.name,
                     split: is_percentage_split(&rule.variations),
                 },
-                send_to_experiment,
             ));
         }
 
@@ -93,19 +81,12 @@ impl Evaluator {
             .ok_or(EvalError::MalformedFlag)?;
         let variation =
             Self::variation(flag, prepared, &rollout.id).ok_or(EvalError::MalformedFlag)?;
-        let send_to_experiment = Self::should_send_to_experiment(
-            flag.expt_include_all_targets,
-            flag.fallthrough.included_in_expt,
-            &dispatch_key,
-            rollout,
-        );
         Ok(Self::result(
             flag,
             variation,
             EvalReason::Fallthrough {
                 split: is_percentage_split(&flag.fallthrough.variations),
             },
-            send_to_experiment,
         ))
     }
 
@@ -113,7 +94,6 @@ impl Evaluator {
         flag: &'snapshot FeatureFlag,
         variation: &'snapshot Variation,
         reason: EvalReason<'snapshot>,
-        send_to_experiment: bool,
     ) -> EvalResult<'snapshot> {
         EvalResult {
             insights_enabled: flag.insights_enabled,
@@ -121,7 +101,6 @@ impl Evaluator {
             flag_type: &flag.variation_type,
             variation,
             reason,
-            send_to_experiment,
         }
     }
 
@@ -151,38 +130,6 @@ impl Evaluator {
         rollouts
             .iter()
             .find(|rollout| matcher.matches(&rollout.rollout))
-    }
-
-    fn should_send_to_experiment(
-        include_all_targets: bool,
-        rule_in_experiment: bool,
-        dispatch_key: &str,
-        rollout: &RolloutVariation,
-    ) -> bool {
-        if include_all_targets {
-            return true;
-        }
-        if !rule_in_experiment {
-            return false;
-        }
-
-        let [lower, upper] = rollout.rollout.as_slice() else {
-            return false;
-        };
-        let dispatch_rollout = upper - lower;
-        if rollout.expt_rollout == 0.0
-            || dispatch_rollout == 0.0
-            || !rollout.expt_rollout.is_finite()
-            || !dispatch_rollout.is_finite()
-        {
-            return false;
-        }
-
-        let experiment_upper = (rollout.expt_rollout / dispatch_rollout).min(1.0);
-        if experiment_upper <= 0.0 {
-            return false;
-        }
-        is_in_rollout(&format!("expt{dispatch_key}"), &[0.0, experiment_upper])
     }
 }
 #[cfg(test)]

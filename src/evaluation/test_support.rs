@@ -11,7 +11,6 @@ pub(crate) fn rollout(id: &str) -> RolloutVariation {
     RolloutVariation {
         id: id.to_owned(),
         rollout: vec![0.0, 1.0],
-        expt_rollout: 0.0,
     }
 }
 
@@ -31,7 +30,6 @@ pub(crate) fn basic_flag(key: &str) -> FeatureFlag {
             variations: vec![rollout("true")],
             ..Fallthrough::default()
         },
-        expt_include_all_targets: false,
         is_archived: false,
     }
 }

@@ -77,10 +77,6 @@ where
         record.add_attribute("feature_flag.key", observation.flag_key().to_owned());
         record.add_attribute("feature_flag.provider.name", "FeatBit");
         record.add_attribute("feature_flag.result.reason", observation.reason().as_str());
-        record.add_attribute(
-            "featbit.evaluation.send_to_experiment",
-            observation.send_to_experiment(),
-        );
 
         if let Some(variation_id) = observation.variation_id() {
             record.add_attribute("feature_flag.result.variant", variation_id.to_owned());
@@ -132,15 +128,15 @@ mod tests {
             "id":"flag-id","key":"enabled","updatedAt":1,"variationType":"boolean",
             "variations":[{"id":"on","value":"true"}],
             "targetUsers":[],"rules":[],"isEnabled":true,
-            "fallthrough":{"includedInExpt":false,"variations":[
-                {"id":"on","rollout":[0,1],"exptRollout":0}
+            "fallthrough":{"variations":[
+                {"id":"on","rollout":[0,1]}
             ]}
         },{
             "id":"invalid-flag-id","key":"invalid-bool","updatedAt":1,"variationType":"boolean",
             "variations":[{"id":"invalid","value":"not-a-boolean"}],
             "targetUsers":[],"rules":[],"isEnabled":true,
-            "fallthrough":{"includedInExpt":false,"variations":[
-                {"id":"invalid","rollout":[0,1],"exptRollout":0}
+            "fallthrough":{"variations":[
+                {"id":"invalid","rollout":[0,1]}
             ]}
         }],"segments":[]}
     }"#;

@@ -11,7 +11,7 @@ use crate::model::FbUser;
 ///
 /// Detail-returning variation methods produce this value in
 /// [`crate::EvaluationDetail::evaluation_event`]. It preserves the selected raw variation and
-/// experiment attribution decision even if flag data changes before the application records the
+/// timestamp even if flag data changes before the application records the
 /// exposure. The captured insights setting controls whether this event can be delivered.
 #[derive(Clone, Eq, PartialEq)]
 pub struct FbEvaluationEvent {
@@ -19,7 +19,6 @@ pub struct FbEvaluationEvent {
     variation_id: String,
     variation_value: String,
     timestamp: SystemTime,
-    send_to_experiment: bool,
     insights_enabled: bool,
 }
 
@@ -27,7 +26,7 @@ impl FbEvaluationEvent {
     /// Creates an explicit evaluation event using the current time.
     ///
     /// Prefer the event returned by a detail variation method when reporting a real SDK evaluation;
-    /// it carries the exact variation, experiment decision, and insights setting selected at
+    /// it carries the exact variation and insights setting selected at
     /// evaluation time. For caller-created events, explicitly supply `insights_enabled`; `false`
     /// prevents tracking. This constructor does not consult the current flag snapshot.
     #[must_use]
@@ -35,7 +34,6 @@ impl FbEvaluationEvent {
         flag_key: impl Into<String>,
         variation_id: impl Into<String>,
         variation_value: impl Into<String>,
-        send_to_experiment: bool,
         insights_enabled: bool,
     ) -> Self {
         Self::at(
@@ -43,7 +41,6 @@ impl FbEvaluationEvent {
             variation_id,
             variation_value,
             SystemTime::now(),
-            send_to_experiment,
             insights_enabled,
         )
     }
@@ -53,7 +50,6 @@ impl FbEvaluationEvent {
         variation_id: impl Into<String>,
         variation_value: impl Into<String>,
         timestamp: SystemTime,
-        send_to_experiment: bool,
         insights_enabled: bool,
     ) -> Self {
         Self {
@@ -61,7 +57,6 @@ impl FbEvaluationEvent {
             variation_id: variation_id.into(),
             variation_value: variation_value.into(),
             timestamp,
-            send_to_experiment,
             insights_enabled,
         }
     }
@@ -99,12 +94,6 @@ impl FbEvaluationEvent {
     pub const fn timestamp(&self) -> SystemTime {
         self.timestamp
     }
-
-    /// Returns whether this exposure is eligible for experiment attribution.
-    #[must_use]
-    pub const fn send_to_experiment(&self) -> bool {
-        self.send_to_experiment
-    }
 }
 
 impl fmt::Debug for FbEvaluationEvent {
@@ -115,7 +104,6 @@ impl fmt::Debug for FbEvaluationEvent {
             .field("variation_id", &self.variation_id)
             .field("variation_value", &"[REDACTED]")
             .field("timestamp", &self.timestamp)
-            .field("send_to_experiment", &self.send_to_experiment)
             .field("insights_enabled", &self.insights_enabled)
             .finish()
     }
@@ -158,7 +146,6 @@ impl PayloadEvent {
             event.variation_id(),
             event.variation_value(),
             event.timestamp(),
-            event.send_to_experiment(),
         )
     }
 
@@ -168,7 +155,6 @@ impl PayloadEvent {
         variation_id: &str,
         variation_value: &str,
         timestamp: SystemTime,
-        send_to_experiment: bool,
     ) -> Self {
         Self::Evaluation(EvaluationPayload {
             user: EventUser::from(user),
@@ -179,7 +165,6 @@ impl PayloadEvent {
                     value: variation_value.to_owned(),
                 },
                 timestamp: unix_millis(timestamp),
-                send_to_experiment,
             }],
         })
     }
@@ -331,7 +316,6 @@ struct EvaluationVariation {
     feature_flag_key: String,
     variation: EventVariation,
     timestamp: i64,
-    send_to_experiment: bool,
 }
 
 #[derive(Clone, Debug, Serialize)]

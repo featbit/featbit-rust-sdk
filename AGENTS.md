@@ -215,7 +215,6 @@ Rollout compatibility is protocol-critical:
 - calculate `abs(value / i32::MIN)` and use the configured inclusive `[min, max]` range;
 - `[0, 1]` always matches and `[0, 0]` never matches;
 - the default dispatch key is `flagKey + userKey`; a configured dispatch property substitutes the user's property value;
-- preserve the .NET `expt`-prefixed experiment sampling calculation and event `sendToExperiment` semantics.
 
 Every compatibility rule needs deterministic fixtures, including cross-language rollout vectors.
 
@@ -234,7 +233,7 @@ Evaluation and `track` calls enqueue immutable payload events using a non-blocki
 
 Preserve FeatBit .NET event wire shapes:
 
-- evaluation payload contains `user`, one `variations` entry, `featureFlagKey`, `variation { id, value }`, Unix-millisecond `timestamp`, and `sendToExperiment`;
+- evaluation payload contains `user`, one `variations` entry, `featureFlagKey`, `variation { id, value }`, and Unix-millisecond `timestamp`;
 - metric payload contains `user`, one `metrics` entry, `appType = "rust-server-side"`, `route = "index/metric"`, `type = "CustomEvent"`, `eventName`, `numericValue`, and timestamp;
 - user payload uses `keyId`, `name`, and `customizedProperties [{ name, value }]`;
 - POST JSON batches to `api/public/insight/track` with `Authorization: <env-secret>` and the SDK user agent.

@@ -23,19 +23,16 @@
         "isEnabled": true,
         "disabledVariationId": "offline-disabled",
         "fallthrough": {
-          "includedInExpt": false,
           "variations": [
             {
               "id": "offline-enabled",
               "rollout": [
                 0,
                 1
-              ],
-              "exptRollout": 0
+              ]
             }
           ]
         },
-        "exptIncludeAllTargets": false,
         "isArchived": false
       }
     ],

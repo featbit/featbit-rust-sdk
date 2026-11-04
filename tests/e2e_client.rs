@@ -26,8 +26,8 @@ const FULL: &str = r#"{
         "id":"e2e-id","key":"e2e-flag","updatedAt":1,"variationType":"boolean",
         "variations":[{"id":"enabled","value":"true"}],
         "targetUsers":[],"rules":[],"isEnabled":true,
-        "fallthrough":{"includedInExpt":false,"variations":[
-            {"id":"enabled","rollout":[0,1],"exptRollout":0}
+        "fallthrough":{"variations":[
+            {"id":"enabled","rollout":[0,1]}
         ]}
     }],"segments":[]}
 }"#;
@@ -38,8 +38,8 @@ const PATCH: &str = r#"{
         "id":"e2e-id","key":"e2e-flag","updatedAt":2,"variationType":"boolean",
         "variations":[{"id":"disabled","value":"false"}],
         "targetUsers":[],"rules":[],"isEnabled":true,
-        "fallthrough":{"includedInExpt":false,"variations":[
-            {"id":"disabled","rollout":[0,1],"exptRollout":0}
+        "fallthrough":{"variations":[
+            {"id":"disabled","rollout":[0,1]}
         ]}
     }],"segments":[]}
 }"#;
